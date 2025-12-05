@@ -1,0 +1,5 @@
+{
+  "name": "RouteOptimizer Pro",
+  "description": "A logistics dashboard to optimize truck routes using Clarke & Wright algorithm with HERE Maps integration.",
+  "requestFramePermissions": []
+}
