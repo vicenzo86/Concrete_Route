@@ -58,6 +58,12 @@ const getOffsetCoords = (coord: GeoCoord, routeIndex: number): L.LatLngTuple => 
     return [coord.lat + shift, coord.lng + shift];
 };
 
+interface MarkerInfo {
+    truckId: string;
+    stopIndex: number;
+    volume: number;
+}
+
 const MapVisualizer: React.FC<MapProps> = ({ routes, origin }) => {
   
   // Aggregate markers logic (matches Python "AGG_MARKERS")
@@ -67,14 +73,14 @@ const MapVisualizer: React.FC<MapProps> = ({ routes, origin }) => {
         latSum: number, 
         lngSum: number, 
         count: number, 
-        popups: string[] 
+        infos: MarkerInfo[] 
     }> = {};
 
     routes.forEach((route, rIdx) => {
         route.stops.forEach((stop, sIdx) => {
             const key = stop.endereco;
             if (!markers[key]) {
-                markers[key] = { latSum: 0, lngSum: 0, count: 0, popups: [] };
+                markers[key] = { latSum: 0, lngSum: 0, count: 0, infos: [] };
             }
             
             // Calculate where the line node is for this stop (the offset position)
@@ -83,7 +89,11 @@ const MapVisualizer: React.FC<MapProps> = ({ routes, origin }) => {
             markers[key].latSum += offLat;
             markers[key].lngSum += offLng;
             markers[key].count += 1;
-            markers[key].popups.push(`Truck ${route.id.replace('Truck ', '')} – Stop ${sIdx + 1}`);
+            markers[key].infos.push({
+                truckId: route.id,
+                stopIndex: sIdx + 1,
+                volume: stop.volume
+            });
         });
     });
 
@@ -91,7 +101,7 @@ const MapVisualizer: React.FC<MapProps> = ({ routes, origin }) => {
         address,
         lat: data.latSum / data.count,
         lng: data.lngSum / data.count,
-        popupHtml: data.popups.join('<br/>')
+        infos: data.infos
     }));
   }, [routes]);
 
@@ -109,9 +119,10 @@ const MapVisualizer: React.FC<MapProps> = ({ routes, origin }) => {
         {origin && (
             <Marker position={[origin.lat, origin.lng]} icon={originIcon}>
                 <Popup>
-                    <strong>ORIGIN</strong><br/>
-                    {/* Origin address not passed to component, but origin object is */}
-                    Depot Location
+                    <div className="font-sans text-sm">
+                        <strong>ORIGIN</strong><br/>
+                        Depot Location
+                    </div>
                 </Popup>
             </Marker>
         )}
@@ -130,8 +141,8 @@ const MapVisualizer: React.FC<MapProps> = ({ routes, origin }) => {
                     positions={points} 
                     color={route.color}
                     weight={4}
-                    opacity={0.7}
-                    dashArray="10, 5"
+                    opacity={0.8} 
+                    dashArray="8, 6" // Matches the Python script style closer
                 />
             );
         })}
@@ -144,9 +155,24 @@ const MapVisualizer: React.FC<MapProps> = ({ routes, origin }) => {
                 // We use default icon which has the correct anchor [12, 41] defined above
              >
                 <Popup>
-                    <div className="text-sm">
-                        <h3 className="font-bold text-slate-800 border-b pb-1 mb-1">{m.address}</h3>
-                        <div className="text-slate-600 leading-tight" dangerouslySetInnerHTML={{ __html: m.popupHtml }} />
+                    <div className="min-w-[180px] font-sans">
+                        <h3 className="font-bold text-slate-900 border-b border-slate-200 pb-2 mb-2 text-sm leading-tight">
+                            {m.address}
+                        </h3>
+                        {m.infos.map((info, i) => (
+                            <div key={i} className={`text-xs text-slate-700 ${i > 0 ? 'mt-3 pt-3 border-t border-slate-100' : ''}`}>
+                                <div className="grid grid-cols-[60px_1fr] gap-1">
+                                    <span className="font-semibold text-slate-500">Route:</span>
+                                    <span className="font-medium">{info.truckId}</span>
+                                    
+                                    <span className="font-semibold text-slate-500">Stop:</span>
+                                    <span>{info.stopIndex}</span>
+                                    
+                                    <span className="font-semibold text-slate-500">Volume:</span>
+                                    <span className="font-bold text-slate-900">{info.volume} m³</span>
+                                </div>
+                            </div>
+                        ))}
                     </div>
                 </Popup>
              </Marker>

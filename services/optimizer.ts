@@ -14,21 +14,118 @@ const ROUTE_COLORS = [
   "#0ea5e9", // sky-500
 ];
 
-// Nearest Neighbor sorting helper (matches Python 'ordenar_nn')
-function nearestNeighborSort(stops: DeliveryStop[], origin: GeoCoord): DeliveryStop[] {
+interface CostMatrix {
+  // key: "lat,lng-lat,lng" -> { time: minutes, dist: km }
+  get(from: GeoCoord, to: GeoCoord): { time: number; dist: number };
+}
+
+// Helper to create matrix key
+const getKey = (a: GeoCoord, b: GeoCoord) => `${a.lat},${a.lng}-${b.lat},${b.lng}`;
+
+// Fetch Real Road Matrix from HERE API
+async function fetchHereMatrix(
+  uniquePoints: GeoCoord[],
+  apiKey: string,
+  onLog: (msg: string) => void
+): Promise<CostMatrix | null> {
+  if (uniquePoints.length < 2) return null;
+  if (uniquePoints.length > 100) {
+    onLog(`⚠️ Too many unique points (${uniquePoints.length}) for single Matrix call. Fallback to estimation.`);
+    return null;
+  }
+
+  onLog(`🌐 Fetching real road data matrix for ${uniquePoints.length} locations...`);
+
+  const url = `https://matrix.router.hereapi.com/v8/matrix?async=false&apiKey=${apiKey}`;
+  
+  const body = {
+    origins: uniquePoints.map(p => ({ lat: p.lat, lng: p.lng })),
+    destinations: uniquePoints.map(p => ({ lat: p.lat, lng: p.lng })),
+    regionDefinition: { type: "world" },
+    matrixAttributes: ["travelTimes", "distances"],
+    transportMode: "car"
+  };
+
+  try {
+    const res = await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body)
+    });
+
+    if (!res.ok) {
+        const errText = await res.text();
+        console.warn("Matrix API Error:", errText);
+        throw new Error(`HERE API Error: ${res.status}`);
+    }
+
+    const data = await res.json();
+    const matrix = data.matrix;
+    // matrix.travelTimes[i * numDest + j]
+    // matrix.distances[i * numDest + j]
+    
+    const numCols = uniquePoints.length;
+    const lookup = new Map<string, { time: number; dist: number }>();
+
+    for (let i = 0; i < uniquePoints.length; i++) {
+        for (let j = 0; j < uniquePoints.length; j++) {
+            const idx = i * numCols + j;
+            const timeSeconds = matrix.travelTimes[idx];
+            const distMeters = matrix.distances[idx];
+            
+            const from = uniquePoints[i];
+            const to = uniquePoints[j];
+            
+            lookup.set(getKey(from, to), {
+                time: Number((timeSeconds / 60).toFixed(2)), // Minutes
+                dist: Number((distMeters / 1000).toFixed(2)) // KM
+            });
+        }
+    }
+
+    return {
+        get: (from, to) => lookup.get(getKey(from, to)) || { time: 9999, dist: 9999 }
+    };
+
+  } catch (err: any) {
+    onLog(`⚠️ Matrix API failed: ${err.message}. Using Haversine estimation.`);
+    return null;
+  }
+}
+
+// Fallback estimator (Haversine * tortuosity / speed)
+const createFallbackMatrix = (): CostMatrix => ({
+    get: (a, b) => {
+        const straightKm = calculateDistanceKm(a, b);
+        const roadKm = straightKm * 1.3; // Estimate road tortuosity
+        const speedKmph = 40; // Est average speed
+        const timeMin = (roadKm / speedKmph) * 60;
+        return {
+            dist: Number(roadKm.toFixed(2)),
+            time: Number(timeMin.toFixed(2))
+        };
+    }
+});
+
+// Nearest Neighbor sorting helper using TIME (matches Python)
+function nearestNeighborSort(
+    stops: DeliveryStop[], 
+    origin: GeoCoord, 
+    matrix: CostMatrix
+): DeliveryStop[] {
     const sorted: DeliveryStop[] = [];
     const currentPool = [...stops];
     let currentLocation = origin;
 
     while (currentPool.length > 0) {
-        // Find closest to currentLocation
         let bestIdx = -1;
-        let bestDist = Infinity;
+        let bestTime = Infinity;
 
         for (let i = 0; i < currentPool.length; i++) {
-            const d = calculateDistanceKm(currentLocation, currentPool[i].coords);
-            if (d < bestDist) {
-                bestDist = d;
+            // Python: min(pend, key=lambda x: travel(atual, x)[0]) -> [0] is time
+            const cost = matrix.get(currentLocation, currentPool[i].coords);
+            if (cost.time < bestTime) {
+                bestTime = cost.time;
                 bestIdx = i;
             }
         }
@@ -39,7 +136,7 @@ function nearestNeighborSort(stops: DeliveryStop[], origin: GeoCoord): DeliveryS
             currentLocation = nextStop.coords;
             currentPool.splice(bestIdx, 1);
         } else {
-            break; // Should not happen
+            break;
         }
     }
     return sorted;
@@ -58,18 +155,21 @@ export const processOptimization = async (
     throw new Error("Could not geocode origin address.");
   }
 
-  // 2. Geocode & Split Volumes (Pre-processing)
-  onLog(`📦 Processing ${rawData.length} rows and checking capacity...`);
+  // 2. Geocode & Split Volumes
+  onLog(`📦 Processing inputs...`);
   
   const allStops: DeliveryStop[] = [];
   const unmapped: string[] = [];
   let stopCounter = 0;
 
+  // Use a map to track unique coords to minimize Matrix calls
+  const uniqueCoordsMap = new Map<string, GeoCoord>();
+  uniqueCoordsMap.set(`${originCoords.lat},${originCoords.lng}`, originCoords);
+
   for (let i = 0; i < rawData.length; i++) {
     const row = rawData[i];
     let vol = row.volume;
     
-    // Geocode once per address
     const coords = await geocodeAddress(row.endereco, config.apiKey);
     
     if (!coords) {
@@ -77,7 +177,8 @@ export const processOptimization = async (
       continue;
     }
 
-    // Split logic (Python: while vol > CAPACIDADE_CAMINHAO)
+    uniqueCoordsMap.set(`${coords.lat},${coords.lng}`, coords);
+
     while (vol > config.truckCapacity) {
       allStops.push({
         id: `${i}_${stopCounter++}`,
@@ -89,7 +190,7 @@ export const processOptimization = async (
       vol -= config.truckCapacity;
     }
 
-    if (vol > 0.001) { // Floating point safety
+    if (vol > 0.001) {
       allStops.push({
         id: `${i}_${stopCounter++}`,
         coords,
@@ -99,34 +200,40 @@ export const processOptimization = async (
       });
     }
 
-    // Small delay to avoid rate limiting if list is huge
     if (i % 5 === 0) await new Promise(r => setTimeout(r, 20));
   }
 
-  onLog(`✅ Generated ${allStops.length} delivery stops from inputs.`);
+  onLog(`✅ Generated ${allStops.length} stops.`);
 
-  // 3. Clarke & Wright Savings Algorithm (Python Logic: Merge & Re-sort)
-  onLog(`🚛 Running Savings Algorithm...`);
+  // 3. Build Cost Matrix
+  const uniquePoints = Array.from(uniqueCoordsMap.values());
+  let matrix = await fetchHereMatrix(uniquePoints, config.apiKey, onLog);
+  
+  if (!matrix) {
+    matrix = createFallbackMatrix();
+  }
 
-  // Initial Solution: Each stop is its own route
-  let routes: Route[] = allStops.map((stop, idx) => ({
-    id: `route_${idx}`, // Temporary ID
-    stops: [stop],
-    totalVolume: stop.volume,
-    totalDistanceKm: calculateDistanceKm(originCoords, stop.coords) * 2,
-    color: '#000' // assigned later
-  }));
+  // 4. Clarke & Wright Savings (Time Based)
+  onLog(`🚛 Running Savings Algorithm (Time-based)...`);
 
-  // Calculate Distances from Origin
-  // Note: Python uses matrix API. Here we use Haversine to avoid 2500+ API calls in browser.
-  // This may cause slight deviations from Python if road distance differs significantly from air distance,
-  // but the logic structure is now identical.
-  const distOrigin = new Map<string, number>();
-  allStops.forEach(stop => {
-    distOrigin.set(stop.id, calculateDistanceKm(originCoords, stop.coords));
+  // Initial Solution
+  let routes: Route[] = allStops.map((stop, idx) => {
+    const toOrigin = matrix!.get(stop.coords, originCoords);
+    const fromOrigin = matrix!.get(originCoords, stop.coords);
+    return {
+        id: `route_${idx}`,
+        stops: [stop],
+        totalVolume: stop.volume,
+        totalDistanceKm: Number((fromOrigin.dist + toOrigin.dist).toFixed(2)),
+        color: '#000'
+    };
   });
 
   // Calculate Savings
+  // Python: save = dist_origem[i] + dist_origem[j] - tij
+  // Note: In Python script, 'dist_origem' comes from 'travel(ORIGEM, s)', which returns TIME [0].
+  // So we MUST use TIME for savings to match Python behavior.
+  
   const savings: { i: string; j: string; save: number }[] = [];
   
   for (let i = 0; i < allStops.length; i++) {
@@ -134,11 +241,11 @@ export const processOptimization = async (
       const stopA = allStops[i];
       const stopB = allStops[j];
       
-      const distAB = calculateDistanceKm(stopA.coords, stopB.coords);
-      const distOA = distOrigin.get(stopA.id)!;
-      const distOB = distOrigin.get(stopB.id)!;
+      const timeOA = matrix.get(originCoords, stopA.coords).time;
+      const timeOB = matrix.get(originCoords, stopB.coords).time; // assuming symmetric for origin
+      const timeIJ = matrix.get(stopA.coords, stopB.coords).time;
       
-      const save = distOA + distOB - distAB;
+      const save = timeOA + timeOB - timeIJ;
       
       if (save > 0) {
         savings.push({ i: stopA.id, j: stopB.id, save });
@@ -146,15 +253,13 @@ export const processOptimization = async (
     }
   }
 
-  // Sort savings descending
+  // Python: savings.sort(reverse=True)
   savings.sort((a, b) => b.save - a.save);
 
   onLog(`📊 Analyzed ${savings.length} potential merges.`);
 
-  // Apply Merges (Python Logic)
+  // Apply Merges
   for (const { i, j } of savings) {
-    // Find current routes for stop i and stop j
-    // We look for which route currently contains stop ID i
     const routeIndexI = routes.findIndex(r => r.stops.some(s => s.id === i));
     const routeIndexJ = routes.findIndex(r => r.stops.some(s => s.id === j));
 
@@ -165,12 +270,11 @@ export const processOptimization = async (
     const routeI = routes[routeIndexI];
     const routeJ = routes[routeIndexJ];
 
-    // Python logic: If combined volume fits, merge and re-sort (NN)
-    // No strict endpoint check (interior merges allowed via reshuffling)
-    if (routeI.totalVolume + routeJ.totalVolume <= config.truckCapacity + 0.001) { // tolerance
+    if (routeI.totalVolume + routeJ.totalVolume <= config.truckCapacity + 0.001) {
         
         const combinedStops = [...routeI.stops, ...routeJ.stops];
-        const reorderedStops = nearestNeighborSort(combinedStops, originCoords);
+        // Python: nova = ordenar_nn(...) using travel time
+        const reorderedStops = nearestNeighborSort(combinedStops, originCoords, matrix);
 
         // Update Route I
         routes[routeIndexI] = {
@@ -189,10 +293,12 @@ export const processOptimization = async (
     let dist = 0;
     let curr = originCoords;
     for (const s of r.stops) {
-        dist += calculateDistanceKm(curr, s.coords);
+        const cost = matrix!.get(curr, s.coords);
+        dist += cost.dist;
         curr = s.coords;
     }
-    dist += calculateDistanceKm(curr, originCoords); // Return to depot
+    const returnCost = matrix!.get(curr, originCoords);
+    dist += returnCost.dist;
 
     return {
         ...r,
