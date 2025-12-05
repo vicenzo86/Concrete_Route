@@ -1,10 +1,9 @@
-import React, { useEffect } from 'react';
+import React, { useEffect, useMemo } from 'react';
 import { MapContainer, TileLayer, Marker, Popup, Polyline, useMap } from 'react-leaflet';
 import L from 'leaflet';
 import { GeoCoord, Route } from '../types';
 
 // Fix for default Leaflet markers in React
-// Using CDN URLs avoids bundler issues with image assets in this environment
 const ICON_URL = 'https://unpkg.com/leaflet@1.9.4/dist/images/marker-icon.png';
 const SHADOW_URL = 'https://unpkg.com/leaflet@1.9.4/dist/images/marker-shadow.png';
 
@@ -12,7 +11,7 @@ let DefaultIcon = L.icon({
     iconUrl: ICON_URL,
     shadowUrl: SHADOW_URL,
     iconSize: [25, 41],
-    iconAnchor: [12, 41],
+    iconAnchor: [12, 41], // Bottom-center to point exactly at location
     popupAnchor: [1, -34],
     shadowSize: [41, 41]
 });
@@ -24,15 +23,6 @@ const originIcon = L.divIcon({
   iconSize: [24, 24],
   iconAnchor: [12, 12]
 });
-
-const createTruckIcon = (color: string, label: string) => L.divIcon({
-  html: `<div style="background-color: ${color}" class="w-8 h-8 rounded-full border-2 border-white shadow-lg flex items-center justify-center text-white font-bold text-xs">${label}</div>`,
-  className: 'custom-div-icon',
-  iconSize: [32, 32],
-  iconAnchor: [16, 32],
-  popupAnchor: [0, -32]
-});
-
 
 interface MapProps {
     routes: Route[];
@@ -59,13 +49,51 @@ const BoundsController: React.FC<{ routes: Route[], origin: GeoCoord | null }> =
     return null;
 };
 
-const MapVisualizer: React.FC<MapProps> = ({ routes, origin }) => {
-  // Offset logic for visualization (similar to the python offset_coord)
-  const getOffsetCoords = (coord: GeoCoord, routeIndex: number): [number, number] => {
+// Logic to calculate offset coordinates
+const getOffsetCoords = (coord: GeoCoord, routeIndex: number): L.LatLngTuple => {
     const scale = 0.00012;
+    // Route index 0 gets shift 1*scale, index 1 gets 2*scale... matches Python logic roughly
+    // Python: shift = i * scale (where i is 1-based index)
     const shift = (routeIndex + 1) * scale;
     return [coord.lat + shift, coord.lng + shift];
-  };
+};
+
+const MapVisualizer: React.FC<MapProps> = ({ routes, origin }) => {
+  
+  // Aggregate markers logic (matches Python "AGG_MARKERS")
+  // We want ONE marker per unique address, positioned at the average of all offsets that visit it
+  const aggregatedMarkers = useMemo(() => {
+    const markers: Record<string, { 
+        latSum: number, 
+        lngSum: number, 
+        count: number, 
+        popups: string[] 
+    }> = {};
+
+    routes.forEach((route, rIdx) => {
+        route.stops.forEach((stop, sIdx) => {
+            const key = stop.endereco;
+            if (!markers[key]) {
+                markers[key] = { latSum: 0, lngSum: 0, count: 0, popups: [] };
+            }
+            
+            // Calculate where the line node is for this stop (the offset position)
+            const [offLat, offLng] = getOffsetCoords(stop.coords, rIdx);
+            
+            markers[key].latSum += offLat;
+            markers[key].lngSum += offLng;
+            markers[key].count += 1;
+            markers[key].popups.push(`Truck ${route.id.replace('Truck ', '')} – Stop ${sIdx + 1}`);
+        });
+    });
+
+    return Object.entries(markers).map(([address, data]) => ({
+        address,
+        lat: data.latSum / data.count,
+        lng: data.lngSum / data.count,
+        popupHtml: data.popups.join('<br/>')
+    }));
+  }, [routes]);
 
   return (
     <div className="h-full w-full min-h-[500px] rounded-lg overflow-hidden border border-slate-200 shadow-inner">
@@ -81,50 +109,49 @@ const MapVisualizer: React.FC<MapProps> = ({ routes, origin }) => {
         {origin && (
             <Marker position={[origin.lat, origin.lng]} icon={originIcon}>
                 <Popup>
-                    <strong>Origin</strong><br/>
+                    <strong>ORIGIN</strong><br/>
+                    {/* Origin address not passed to component, but origin object is */}
                     Depot Location
                 </Popup>
             </Marker>
         )}
 
-        {/* Routes */}
+        {/* Routes Polylines */}
         {routes.map((route, rIdx) => {
             // Build polyline points including origin start/end
-            const points: [number, number][] = [];
+            const points: L.LatLngTuple[] = [];
             if (origin) points.push(getOffsetCoords(origin, rIdx));
             route.stops.forEach(s => points.push(getOffsetCoords(s.coords, rIdx)));
             if (origin) points.push(getOffsetCoords(origin, rIdx));
 
             return (
-                <React.Fragment key={route.id}>
-                    <Polyline 
-                        positions={points} 
-                        color={route.color}
-                        weight={4}
-                        opacity={0.7}
-                        dashArray="10, 5"
-                    />
-                    {route.stops.map((stop, sIdx) => (
-                        <Marker 
-                            key={stop.id} 
-                            position={getOffsetCoords(stop.coords, rIdx)}
-                            icon={createTruckIcon(route.color, (sIdx + 1).toString())}
-                        >
-                            <Popup>
-                                <div className="text-sm">
-                                    <h3 className="font-bold text-slate-800">{stop.endereco}</h3>
-                                    <div className="mt-1 text-slate-600">
-                                        Route: {route.id}<br/>
-                                        Stop: {sIdx + 1}<br/>
-                                        Volume: {stop.volume} m³
-                                    </div>
-                                </div>
-                            </Popup>
-                        </Marker>
-                    ))}
-                </React.Fragment>
+                <Polyline 
+                    key={route.id}
+                    positions={points} 
+                    color={route.color}
+                    weight={4}
+                    opacity={0.7}
+                    dashArray="10, 5"
+                />
             );
         })}
+
+        {/* Aggregated Markers */}
+        {aggregatedMarkers.map((m, idx) => (
+             <Marker 
+                key={idx} 
+                position={[m.lat, m.lng]} 
+                // We use default icon which has the correct anchor [12, 41] defined above
+             >
+                <Popup>
+                    <div className="text-sm">
+                        <h3 className="font-bold text-slate-800 border-b pb-1 mb-1">{m.address}</h3>
+                        <div className="text-slate-600 leading-tight" dangerouslySetInnerHTML={{ __html: m.popupHtml }} />
+                    </div>
+                </Popup>
+             </Marker>
+        ))}
+
       </MapContainer>
     </div>
   );

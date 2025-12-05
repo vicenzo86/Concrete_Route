@@ -10,7 +10,40 @@ const ROUTE_COLORS = [
   "#EC4899", // pink-500
   "#6366F1", // indigo-500
   "#14B8A6", // teal-500
+  "#84cc16", // lime-500
+  "#0ea5e9", // sky-500
 ];
+
+// Nearest Neighbor sorting helper (matches Python 'ordenar_nn')
+function nearestNeighborSort(stops: DeliveryStop[], origin: GeoCoord): DeliveryStop[] {
+    const sorted: DeliveryStop[] = [];
+    const currentPool = [...stops];
+    let currentLocation = origin;
+
+    while (currentPool.length > 0) {
+        // Find closest to currentLocation
+        let bestIdx = -1;
+        let bestDist = Infinity;
+
+        for (let i = 0; i < currentPool.length; i++) {
+            const d = calculateDistanceKm(currentLocation, currentPool[i].coords);
+            if (d < bestDist) {
+                bestDist = d;
+                bestIdx = i;
+            }
+        }
+
+        if (bestIdx !== -1) {
+            const nextStop = currentPool[bestIdx];
+            sorted.push(nextStop);
+            currentLocation = nextStop.coords;
+            currentPool.splice(bestIdx, 1);
+        } else {
+            break; // Should not happen
+        }
+    }
+    return sorted;
+}
 
 export const processOptimization = async (
   rawData: RawInputRow[],
@@ -56,7 +89,7 @@ export const processOptimization = async (
       vol -= config.truckCapacity;
     }
 
-    if (vol > 0) {
+    if (vol > 0.001) { // Floating point safety
       allStops.push({
         id: `${i}_${stopCounter++}`,
         coords,
@@ -67,32 +100,34 @@ export const processOptimization = async (
     }
 
     // Small delay to avoid rate limiting if list is huge
-    if (i % 5 === 0) await new Promise(r => setTimeout(r, 50));
+    if (i % 5 === 0) await new Promise(r => setTimeout(r, 20));
   }
 
   onLog(`✅ Generated ${allStops.length} delivery stops from inputs.`);
 
-  // 3. Clarke & Wright Savings Algorithm
+  // 3. Clarke & Wright Savings Algorithm (Python Logic: Merge & Re-sort)
   onLog(`🚛 Running Savings Algorithm...`);
 
   // Initial Solution: Each stop is its own route
-  // Map route ID to route object
   let routes: Route[] = allStops.map((stop, idx) => ({
-    id: `route_${idx}`,
+    id: `route_${idx}`, // Temporary ID
     stops: [stop],
     totalVolume: stop.volume,
     totalDistanceKm: calculateDistanceKm(originCoords, stop.coords) * 2,
-    color: ROUTE_COLORS[idx % ROUTE_COLORS.length]
+    color: '#000' // assigned later
   }));
 
   // Calculate Distances from Origin
+  // Note: Python uses matrix API. Here we use Haversine to avoid 2500+ API calls in browser.
+  // This may cause slight deviations from Python if road distance differs significantly from air distance,
+  // but the logic structure is now identical.
   const distOrigin = new Map<string, number>();
   allStops.forEach(stop => {
     distOrigin.set(stop.id, calculateDistanceKm(originCoords, stop.coords));
   });
 
   // Calculate Savings
-  const savings: { i: DeliveryStop; j: DeliveryStop; save: number }[] = [];
+  const savings: { i: string; j: string; save: number }[] = [];
   
   for (let i = 0; i < allStops.length; i++) {
     for (let j = i + 1; j < allStops.length; j++) {
@@ -100,10 +135,13 @@ export const processOptimization = async (
       const stopB = allStops[j];
       
       const distAB = calculateDistanceKm(stopA.coords, stopB.coords);
-      const save = (distOrigin.get(stopA.id)! + distOrigin.get(stopB.id)!) - distAB;
+      const distOA = distOrigin.get(stopA.id)!;
+      const distOB = distOrigin.get(stopB.id)!;
+      
+      const save = distOA + distOB - distAB;
       
       if (save > 0) {
-        savings.push({ i: stopA, j: stopB, save });
+        savings.push({ i: stopA.id, j: stopB.id, save });
       }
     }
   }
@@ -113,11 +151,12 @@ export const processOptimization = async (
 
   onLog(`📊 Analyzed ${savings.length} potential merges.`);
 
-  // Apply Merges
+  // Apply Merges (Python Logic)
   for (const { i, j } of savings) {
     // Find current routes for stop i and stop j
-    const routeIndexI = routes.findIndex(r => r.stops.some(s => s.id === i.id));
-    const routeIndexJ = routes.findIndex(r => r.stops.some(s => s.id === j.id));
+    // We look for which route currently contains stop ID i
+    const routeIndexI = routes.findIndex(r => r.stops.some(s => s.id === i));
+    const routeIndexJ = routes.findIndex(r => r.stops.some(s => s.id === j));
 
     if (routeIndexI === -1 || routeIndexJ === -1 || routeIndexI === routeIndexJ) {
       continue;
@@ -126,44 +165,18 @@ export const processOptimization = async (
     const routeI = routes[routeIndexI];
     const routeJ = routes[routeIndexJ];
 
-    // Check Constraints: Interior vs Exterior points
-    // Simplified C&W: We merge if i is last of routeI and j is first of routeJ (or reversible)
-    // For this lightweight implementation, we'll try to append routeJ to routeI if volume allows
-    // Note: A full robust C&W checks endpoints specifically. 
-    
-    // Check Volume
-    if (routeI.totalVolume + routeJ.totalVolume <= config.truckCapacity) {
-        // Basic check: Is stop i at an edge of route I? Is stop j at an edge of route J?
-        const iIsFirst = routeI.stops[0].id === i.id;
-        const iIsLast = routeI.stops[routeI.stops.length - 1].id === i.id;
-        const jIsFirst = routeJ.stops[0].id === j.id;
-        const jIsLast = routeJ.stops[routeJ.stops.length - 1].id === j.id;
-
-        let newStops: DeliveryStop[] = [];
-
-        if (iIsLast && jIsFirst) {
-            newStops = [...routeI.stops, ...routeJ.stops];
-        } else if (iIsFirst && jIsLast) {
-            newStops = [...routeJ.stops, ...routeI.stops]; // J then I
-        } else if (iIsLast && jIsLast) {
-             // Reverse J
-             newStops = [...routeI.stops, ...[...routeJ.stops].reverse()];
-        } else if (iIsFirst && jIsFirst) {
-             // Reverse I
-             newStops = [...[...routeI.stops].reverse(), ...routeJ.stops];
-        } else {
-            continue; // Cannot merge interior points
-        }
-
-        // Merge successful
-        const newVolume = routeI.totalVolume + routeJ.totalVolume;
+    // Python logic: If combined volume fits, merge and re-sort (NN)
+    // No strict endpoint check (interior merges allowed via reshuffling)
+    if (routeI.totalVolume + routeJ.totalVolume <= config.truckCapacity + 0.001) { // tolerance
         
+        const combinedStops = [...routeI.stops, ...routeJ.stops];
+        const reorderedStops = nearestNeighborSort(combinedStops, originCoords);
+
         // Update Route I
         routes[routeIndexI] = {
             ...routeI,
-            stops: newStops,
-            totalVolume: newVolume,
-            // Recalculate color or keep
+            stops: reorderedStops,
+            totalVolume: routeI.totalVolume + routeJ.totalVolume,
         };
 
         // Remove Route J
@@ -171,8 +184,7 @@ export const processOptimization = async (
     }
   }
 
-  // Recalculate final metrics and re-sort route NN (Nearest Neighbor) is optional but C&W usually handles sequence.
-  // We will run a simple cleanup pass to ensure distances are correct
+  // Final cleanup and formatting
   const finalRoutes = routes.map((r, idx) => {
     let dist = 0;
     let curr = originCoords;
