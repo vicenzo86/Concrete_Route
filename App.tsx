@@ -37,45 +37,110 @@ const App: React.FC = () => {
     const file = e.target.files?.[0];
     if (!file) return;
 
+    // Reset previous data
+    setRawData([]);
+    setState(prev => ({ ...prev, logs: [`📂 Reading file: ${file.name}...`], status: 'idle' }));
+
     const reader = new FileReader();
+    
     reader.onload = (evt) => {
       try {
-        const bstr = evt.target?.result;
-        const wb = XLSX.read(bstr, { type: 'binary' });
+        const data = evt.target?.result;
+        if (!data) throw new Error("File is empty");
+
+        const wb = XLSX.read(data, { type: 'array' });
         const wsname = wb.SheetNames[0];
         const ws = wb.Sheets[wsname];
-        // Expect headers: "volume" and "endereco" (or map them)
+        
+        // Get data as array of arrays
         const jsonData = XLSX.utils.sheet_to_json(ws, { header: 1 });
         
-        // Simple heuristic to find columns
-        const headers = (jsonData[0] as string[]).map(h => h.toLowerCase());
-        const volIdx = headers.findIndex(h => h.includes('volume') || h.includes('m³'));
-        const addrIdx = headers.findIndex(h => h.includes('endereco') || h.includes('endereço'));
+        if (!jsonData || jsonData.length < 2) {
+            addLog("❌ Error: File appears to be empty or has no data rows.");
+            return;
+        }
+
+        // Robust header finding
+        const headers = (jsonData[0] as any[]).map(h => String(h || '').toLowerCase().trim());
+        addLog(`🔍 Found headers: [${headers.join(", ")}]`);
+
+        // Flexible matching for Volume
+        const volIdx = headers.findIndex(h => 
+            h.includes('volume') || 
+            h.includes('m³') || 
+            h.includes('m3') || 
+            h.includes('vol') ||
+            h.includes('cubagem') ||
+            h.includes('qtd')
+        );
+
+        // Flexible matching for Address
+        const addrIdx = headers.findIndex(h => 
+            h.includes('endereco') || 
+            h.includes('endereço') || 
+            h.includes('address') || 
+            h.includes('local') || 
+            h.includes('rua') || 
+            h.includes('destino') ||
+            h.includes('dest') ||
+            h.includes('cliente')
+        );
 
         if (volIdx === -1 || addrIdx === -1) {
-            alert("Could not find 'm³'/'volume' or 'Address' columns in the first row.");
+            const missing = [];
+            if (volIdx === -1) missing.push("Volume (e.g., 'Volume', 'm³')");
+            if (addrIdx === -1) missing.push("Address (e.g., 'Endereço', 'Rua')");
+            
+            const msg = `❌ Missing columns: ${missing.join(" and ")}.`;
+            addLog(msg);
+            alert(msg + "\nPlease check the System Logs for details.");
             return;
         }
 
         const parsed: RawInputRow[] = [];
+        let skipped = 0;
+
         for (let i = 1; i < jsonData.length; i++) {
             const row: any = jsonData[i];
-            if (row[volIdx] && row[addrIdx]) {
-                parsed.push({
-                    volume: parseFloat(row[volIdx]),
-                    endereco: row[addrIdx]
-                });
+            // Ensure row has data at the expected indices
+            if (row[volIdx] !== undefined && row[addrIdx]) {
+                const vol = parseFloat(row[volIdx]);
+                const addr = String(row[addrIdx]).trim();
+
+                if (!isNaN(vol) && addr.length > 3) {
+                    parsed.push({
+                        volume: vol,
+                        endereco: addr
+                    });
+                } else {
+                    skipped++;
+                }
             }
         }
         
+        if (parsed.length === 0) {
+            addLog("❌ No valid data rows found after parsing.");
+            return;
+        }
+
         setRawData(parsed);
-        addLog(`📂 Loaded ${parsed.length} rows from ${file.name}`);
-      } catch (err) {
+        addLog(`✅ Successfully loaded ${parsed.length} rows (${skipped} empty/invalid skipped).`);
+        
+        // Auto-switch to Data tab to show loaded data
+        // setActiveTab('data'); 
+
+      } catch (err: any) {
         console.error(err);
-        alert("Error parsing Excel file");
+        addLog(`❌ File parse error: ${err.message}`);
+        alert("Error parsing Excel file. See logs.");
       }
     };
-    reader.readAsBinaryString(file);
+
+    reader.onerror = () => {
+        addLog("❌ Failed to read file.");
+    };
+
+    reader.readAsArrayBuffer(file);
   };
 
   const handleRun = async () => {
