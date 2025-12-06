@@ -71,7 +71,8 @@ const App: React.FC = () => {
             h.includes('m3') || 
             h.includes('vol') ||
             h.includes('cubagem') ||
-            h.includes('qtd')
+            h.includes('qtd') ||
+            h.includes('carga') // Added support for 'CARGAS'
         );
 
         // Flexible matching for Address
@@ -83,13 +84,14 @@ const App: React.FC = () => {
             h.includes('rua') || 
             h.includes('destino') ||
             h.includes('dest') ||
-            h.includes('cliente')
+            h.includes('cliente') ||
+            h.includes('obra')
         );
 
         if (volIdx === -1 || addrIdx === -1) {
             const missing = [];
-            if (volIdx === -1) missing.push("Volume (e.g., 'Volume', 'm³')");
-            if (addrIdx === -1) missing.push("Address (e.g., 'Endereço', 'Rua')");
+            if (volIdx === -1) missing.push("Volume (e.g., 'Cargas', 'Volume', 'm³')");
+            if (addrIdx === -1) missing.push("Address (e.g., 'Endereço Obra', 'Rua')");
             
             const msg = `❌ Missing columns: ${missing.join(" and ")}.`;
             addLog(msg);
