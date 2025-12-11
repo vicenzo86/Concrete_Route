@@ -1,6 +1,6 @@
 import React, { useState, useRef } from 'react';
 import * as XLSX from 'xlsx';
-import { Truck, MapPin, Settings, Upload, Play, AlertCircle, Terminal, Map as MapIcon, Table, Download, Clock, Zap, Sun, Moon } from 'lucide-react';
+import { Truck, MapPin, Settings, Terminal, Map as MapIcon, Table, Download, Clock, Zap, Sun, Moon, Calendar, Key } from 'lucide-react';
 import MapVisualizer from './components/MapVisualizer';
 import ResultsTable from './components/ResultsTable';
 import { AppState, RawInputRow, Shift, ShiftState } from './types';
@@ -8,7 +8,6 @@ import { processOptimization } from './services/optimizer';
 
 const DEFAULT_API_KEY = "9bzBwwsjHfKmfIrrYpvtir7DbEjTUOj2vFWrAC72c4A";
 const DEFAULT_ORIGIN = "R. Geral Hugo de Almeida - Navegantes - SC, Brasil";
-const DEFAULT_CAPACITY = 9;
 
 const initialShiftState: ShiftState = {
   rawData: [],
@@ -22,9 +21,9 @@ const App: React.FC = () => {
     config: {
       apiKey: DEFAULT_API_KEY,
       originAddress: DEFAULT_ORIGIN,
-      truckCapacity: DEFAULT_CAPACITY,
-      startTime: "07:00",
-      loadingTimeMin: 20,
+      truckCapacity: 9,
+      startTime: "05:00",
+      loadingTimeMin: 30,
       unloadingMinPerM3: 10,
     },
     currentShift: 'morning',
@@ -38,8 +37,8 @@ const App: React.FC = () => {
 
   const [activeTab, setActiveTab] = useState<'map' | 'data'>('map');
   const fileInputRef = useRef<HTMLInputElement>(null);
-
   const activeShift = state.shifts[state.currentShift];
+  const isProcessing = state.shifts.morning.status === 'geocoding' || state.shifts.afternoon.status === 'geocoding';
 
   const addLog = (msg: string) => {
     setState(prev => ({ ...prev, logs: [...prev.logs, msg] }));
@@ -50,18 +49,13 @@ const App: React.FC = () => {
     if (!file) return;
 
     addLog(`📂 Lendo arquivo: ${file.name}...`);
-
     const reader = new FileReader();
     reader.onload = (evt) => {
       try {
         const data = evt.target?.result;
         if (!data) throw new Error("Arquivo vazio");
         const wb = XLSX.read(data, { type: 'array' });
-        
-        const newShifts = {
-          morning: { ...initialShiftState },
-          afternoon: { ...initialShiftState },
-        };
+        const newShifts = { morning: { ...initialShiftState }, afternoon: { ...initialShiftState } };
 
         wb.SheetNames.forEach(sheetName => {
           const ws = wb.Sheets[sheetName];
@@ -82,175 +76,212 @@ const App: React.FC = () => {
           const nameUpper = sheetName.toUpperCase();
           if (nameUpper.includes("MANHÃ") || nameUpper.includes("MANHA")) {
             newShifts.morning.rawData = parsed;
-            addLog(`✅ Turno MANHÃ: ${parsed.length} pedidos carregados.`);
+            addLog(`✅ Turno MANHÃ: ${parsed.length} pedidos detectados.`);
           } else if (nameUpper.includes("TARDE")) {
             newShifts.afternoon.rawData = parsed;
-            addLog(`✅ Turno TARDE: ${parsed.length} pedidos carregados.`);
+            addLog(`✅ Turno TARDE: ${parsed.length} pedidos detectados.`);
           }
         });
-
         setState(prev => ({ ...prev, shifts: newShifts }));
-      } catch (err: any) { 
-        addLog(`❌ Erro no arquivo: ${err.message}`); 
-      }
+      } catch (err: any) { addLog(`❌ Erro ao ler planilha: ${err.message}`); }
     };
     reader.readAsArrayBuffer(file);
   };
 
   const handleRun = async () => {
-    if (activeShift.rawData.length === 0) return alert("Não há dados para este turno.");
-    
-    // Set status for current shift
+    const hasMorning = state.shifts.morning.rawData.length > 0;
+    const hasAfternoon = state.shifts.afternoon.rawData.length > 0;
+
+    if (!hasMorning && !hasAfternoon) {
+        return alert("Não há dados carregados para nenhum turno. Importe a planilha com as abas MANHÃ e TARDE.");
+    }
+
     setState(prev => ({
       ...prev,
       shifts: {
-        ...prev.shifts,
-        [prev.currentShift]: { ...prev.shifts[prev.currentShift], status: 'geocoding' }
+          morning: { ...prev.shifts.morning, status: hasMorning ? 'geocoding' : 'idle' },
+          afternoon: { ...prev.shifts.afternoon, status: hasAfternoon ? 'geocoding' : 'idle' }
       },
       logs: []
     }));
 
     try {
-        const result = await processOptimization(activeShift.rawData, state.config, addLog);
+        let morningRes = null;
+        let afternoonRes = null;
+        let finalOrigin = state.originCoords;
+
+        if (hasMorning) {
+            addLog(`🚀 [MANHÃ] Iniciando Geocodificação e Otimização...`);
+            morningRes = await processOptimization(state.shifts.morning.rawData, state.config, (msg) => addLog(`[MANHÃ] ${msg}`));
+            finalOrigin = morningRes.originCoords;
+        }
+
+        if (hasAfternoon) {
+            addLog(`🚀 [TARDE] Iniciando Geocodificação e Otimização...`);
+            afternoonRes = await processOptimization(state.shifts.afternoon.rawData, state.config, (msg) => addLog(`[TARDE] ${msg}`));
+            if (!finalOrigin) finalOrigin = afternoonRes.originCoords;
+        }
+
         setState(prev => ({
             ...prev,
-            originCoords: result.originCoords,
+            originCoords: finalOrigin,
             shifts: {
-              ...prev.shifts,
-              [prev.currentShift]: {
-                ...prev.shifts[prev.currentShift],
-                status: 'complete',
-                routes: result.routes,
-                unmappedAddresses: result.unmapped
-              }
+              morning: morningRes ? { ...prev.shifts.morning, status: 'complete', routes: morningRes.routes, unmappedAddresses: morningRes.unmapped } : prev.shifts.morning,
+              afternoon: afternoonRes ? { ...prev.shifts.afternoon, status: 'complete', routes: afternoonRes.routes, unmappedAddresses: afternoonRes.unmapped } : prev.shifts.afternoon
             }
         }));
+        
+        addLog(`✨ Processamento Completo para todos os turnos ativos.`);
     } catch (err: any) {
-        addLog(`❌ Erro: ${err.message}`);
-        setState(prev => ({
-          ...prev,
-          shifts: {
-            ...prev.shifts,
-            [prev.currentShift]: { ...prev.shifts[prev.currentShift], status: 'error' }
-          }
+        addLog(`❌ Erro Crítico: ${err.message}`);
+        setState(prev => ({ 
+            ...prev, 
+            shifts: { 
+                morning: { ...prev.shifts.morning, status: prev.shifts.morning.status === 'geocoding' ? 'error' : prev.shifts.morning.status },
+                afternoon: { ...prev.shifts.afternoon, status: prev.shifts.afternoon.status === 'geocoding' ? 'error' : prev.shifts.afternoon.status }
+            } 
         }));
     }
   };
 
   return (
     <div className="flex flex-col h-screen bg-slate-50 font-sans">
+      {/* Header */}
       <header className="bg-slate-900 border-b border-slate-700 px-6 py-4 flex items-center justify-between shadow-lg z-10 text-white">
         <div className="flex items-center gap-3">
           <div className="p-2 bg-amber-500 rounded-lg shadow-md">
             <Truck className="text-slate-900 w-6 h-6" />
           </div>
           <div>
-            <h1 className="text-xl font-bold tracking-tight">Plaster Router</h1>
-            <p className="text-xs text-amber-500 font-medium uppercase tracking-widest">Controle de Turnos e Frota</p>
+            <h1 className="text-xl font-bold tracking-tight">Arga Router</h1>
+            <p className="text-[10px] text-amber-500 font-bold uppercase tracking-[0.2em]">Logística de Argamassa</p>
           </div>
         </div>
         
-        <div className="flex bg-slate-800 rounded-lg p-1 border border-slate-700">
-            <button 
-                onClick={() => setState(p => ({...p, currentShift: 'morning'}))}
-                className={`flex items-center gap-2 px-4 py-1.5 rounded-md text-xs font-bold transition-all ${state.currentShift === 'morning' ? 'bg-amber-500 text-slate-900 shadow-sm' : 'text-slate-400 hover:text-white'}`}
-            >
-                <Sun size={14} /> MANHÃ
-            </button>
-            <button 
-                onClick={() => setState(p => ({...p, currentShift: 'afternoon'}))}
-                className={`flex items-center gap-2 px-4 py-1.5 rounded-md text-xs font-bold transition-all ${state.currentShift === 'afternoon' ? 'bg-amber-500 text-slate-900 shadow-sm' : 'text-slate-400 hover:text-white'}`}
-            >
-                <Moon size={14} /> TARDE
-            </button>
-        </div>
-
-        <div className="text-xs text-slate-400 flex items-center gap-4">
-            <div className="flex flex-col items-end">
-                <span>Pedidos Ativos</span>
-                <span className="text-white font-bold">{activeShift.rawData.length}</span>
+        <div className="flex items-center gap-6">
+            <div className="flex bg-slate-800 rounded-full p-1 border border-slate-700 shadow-inner">
+                <button onClick={() => setState(p => ({...p, currentShift: 'morning'}))} className={`flex items-center gap-2 px-5 py-2 rounded-full text-xs font-bold transition-all ${state.currentShift === 'morning' ? 'bg-amber-500 text-slate-900 shadow-md scale-105' : 'text-slate-400 hover:text-slate-200'}`}>
+                    <Sun size={14} /> MANHÃ {state.shifts.morning.rawData.length > 0 && `(${state.shifts.morning.rawData.length})`}
+                </button>
+                <button onClick={() => setState(p => ({...p, currentShift: 'afternoon'}))} className={`flex items-center gap-2 px-5 py-2 rounded-full text-xs font-bold transition-all ${state.currentShift === 'afternoon' ? 'bg-amber-500 text-slate-900 shadow-md scale-105' : 'text-slate-400 hover:text-slate-200'}`}>
+                    <Moon size={14} /> TARDE {state.shifts.afternoon.rawData.length > 0 && `(${state.shifts.afternoon.rawData.length})`}
+                </button>
             </div>
-            <Download size={16} className="cursor-pointer hover:text-white" />
+            <div className="text-xs text-slate-400 flex items-center gap-4 border-l border-slate-700 pl-6">
+                <div className="flex flex-col items-end">
+                    <span className="text-[9px] uppercase font-bold text-slate-500">Viagens Atuais</span>
+                    <span className="text-white font-bold text-sm">{activeShift.routes.length}</span>
+                </div>
+            </div>
         </div>
       </header>
 
       <div className="flex flex-1 overflow-hidden">
-        <aside className="w-80 bg-slate-800 border-r border-slate-700 flex flex-col overflow-y-auto text-slate-300">
-          <div className="p-5 border-b border-slate-700">
-            <h2 className="text-xs uppercase tracking-widest text-slate-500 font-bold mb-4 flex items-center gap-2">
-                <Settings size={14} /> Configuração Operacional
-            </h2>
+        {/* Sidebar */}
+        <aside className="w-80 bg-slate-900 border-r border-slate-800 flex flex-col overflow-y-auto">
+          <div className="p-6 space-y-6">
+            {/* API Config */}
             <div className="space-y-4">
-              <div>
-                <label className="block text-[10px] font-bold text-slate-500 uppercase mb-1">Início do Turno</label>
+               <div>
+                <label className="block text-[10px] font-bold text-slate-500 uppercase mb-2 tracking-widest">HERE API Key</label>
                 <div className="relative">
-                    <Clock className="absolute left-2.5 top-2.5 text-slate-500 w-4 h-4" />
-                    <input type="time" value={state.config.startTime}
-                      onChange={e => setState(p => ({...p, config: {...p.config, startTime: e.target.value}}))}
-                      className="w-full pl-9 pr-3 py-2 bg-slate-900 border border-slate-700 rounded-md text-sm focus:ring-1 focus:ring-amber-500 outline-none"/>
+                    <Key className="absolute left-3 top-2.5 text-slate-600 w-4 h-4" />
+                    <input type="password" value={state.config.apiKey}
+                      onChange={e => setState(p => ({...p, config: {...p.config, apiKey: e.target.value}}))}
+                      className="w-full pl-9 pr-3 py-2 bg-slate-800 border border-slate-700 rounded-md text-sm text-slate-200 focus:ring-1 focus:ring-amber-500 outline-none transition-all"/>
                 </div>
               </div>
-              <div className="grid grid-cols-2 gap-2">
-                  <div>
-                    <label className="block text-[10px] font-bold text-slate-500 uppercase mb-1">Carga (min)</label>
-                    <input type="number" value={state.config.loadingTimeMin}
-                      onChange={e => setState(p => ({...p, config: {...p.config, loadingTimeMin: parseInt(e.target.value)}}))}
-                      className="w-full px-3 py-2 bg-slate-900 border border-slate-700 rounded-md text-sm focus:ring-1 focus:ring-amber-500 outline-none"/>
-                  </div>
-                  <div>
-                    <label className="block text-[10px] font-bold text-slate-500 uppercase mb-1">Descarga (min/m³)</label>
-                    <input type="number" value={state.config.unloadingMinPerM3}
-                      onChange={e => setState(p => ({...p, config: {...p.config, unloadingMinPerM3: parseInt(e.target.value)}}))}
-                      className="w-full px-3 py-2 bg-slate-900 border border-slate-700 rounded-md text-sm focus:ring-1 focus:ring-amber-500 outline-none"/>
-                  </div>
-              </div>
               <div>
-                <label className="block text-[10px] font-bold text-slate-500 uppercase mb-1">Capacidade Caminhão (m³)</label>
-                <input type="number" value={state.config.truckCapacity}
-                  onChange={e => setState(p => ({...p, config: {...p.config, truckCapacity: parseFloat(e.target.value)}}))}
-                  className="w-full px-3 py-2 bg-slate-900 border border-slate-700 rounded-md text-sm focus:ring-1 focus:ring-amber-500 outline-none"/>
+                <label className="block text-[10px] font-bold text-slate-500 uppercase mb-2 tracking-widest">Endereço da Filial</label>
+                <div className="relative">
+                    <MapPin className="absolute left-3 top-2.5 text-slate-600 w-4 h-4" />
+                    <input type="text" value={state.config.originAddress}
+                      onChange={e => setState(p => ({...p, config: {...p.config, originAddress: e.target.value}}))}
+                      className="w-full pl-9 pr-3 py-2 bg-slate-800 border border-slate-700 rounded-md text-xs text-slate-200 focus:ring-1 focus:ring-amber-500 outline-none"/>
+                </div>
               </div>
             </div>
-          </div>
 
-          <div className="p-5 border-b border-slate-700 bg-slate-900/20">
-            <input type="file" ref={fileInputRef} className="hidden" accept=".xlsx, .xls" onChange={handleFileChange} />
-            <button onClick={() => fileInputRef.current?.click()} className="w-full border-2 border-dashed border-slate-700 rounded-lg p-5 flex flex-col items-center justify-center text-slate-500 hover:border-amber-500 hover:text-amber-500 transition-all cursor-pointer">
-                <Table className="w-6 h-6 mb-2" />
-                <span className="text-[10px] font-bold uppercase tracking-tighter">Carregar Planilha Bi-Turno</span>
-                <span className="text-[9px] text-slate-600 mt-1">Abas: MANHÃ / TARDE</span>
+            <div className="h-px bg-slate-800 w-full" />
+
+            {/* Global Params */}
+            <div>
+                <h2 className="text-[10px] uppercase tracking-widest text-slate-500 font-bold mb-4 flex items-center gap-2">
+                    <Settings size={14} /> Parâmetros Globais
+                </h2>
+                <div className="grid grid-cols-2 gap-3">
+                  <div>
+                    <label className="block text-[9px] font-bold text-slate-600 uppercase mb-1">Total Bombas</label>
+                    <input type="number" defaultValue={4} className="w-full px-3 py-2 bg-slate-800 border border-slate-700 rounded-md text-sm text-slate-300"/>
+                  </div>
+                  <div>
+                    <label className="block text-[9px] font-bold text-slate-600 uppercase mb-1">Total Frota</label>
+                    <input type="number" defaultValue={30} className="w-full px-3 py-2 bg-slate-800 border border-slate-700 rounded-md text-sm text-slate-300"/>
+                  </div>
+                  <div>
+                    <label className="block text-[9px] font-bold text-slate-600 uppercase mb-1">Carga (min)</label>
+                    <input type="number" value={state.config.loadingTimeMin}
+                      onChange={e => setState(p => ({...p, config: {...p.config, loadingTimeMin: parseInt(e.target.value)}}))}
+                      className="w-full px-3 py-2 bg-slate-800 border border-slate-700 rounded-md text-sm text-slate-300"/>
+                  </div>
+                  <div>
+                    <label className="block text-[9px] font-bold text-slate-600 uppercase mb-1">Descarga (min/m³)</label>
+                    <input type="number" value={state.config.unloadingMinPerM3}
+                      onChange={e => setState(p => ({...p, config: {...p.config, unloadingMinPerM3: parseInt(e.target.value)}}))}
+                      className="w-full px-3 py-2 bg-slate-800 border border-slate-700 rounded-md text-sm text-slate-300"/>
+                  </div>
+                  <div>
+                    <label className="block text-[9px] font-bold text-slate-600 uppercase mb-1">Data</label>
+                    <div className="relative">
+                        <Calendar className="absolute right-2 top-2.5 text-slate-600 w-3 h-3" />
+                        <input type="text" defaultValue="11/12/2025" className="w-full px-3 py-2 bg-slate-800 border border-slate-700 rounded-md text-[10px] text-slate-300 uppercase"/>
+                    </div>
+                  </div>
+                  <div>
+                    <label className="block text-[9px] font-bold text-slate-600 uppercase mb-1">Início</label>
+                    <div className="relative">
+                        <Clock className="absolute right-2 top-2.5 text-slate-600 w-3 h-3" />
+                        <input type="time" value={state.config.startTime}
+                            onChange={e => setState(p => ({...p, config: {...p.config, startTime: e.target.value}}))}
+                            className="w-full px-3 py-2 bg-slate-800 border border-slate-700 rounded-md text-[10px] text-slate-300 uppercase"/>
+                    </div>
+                  </div>
+                </div>
+            </div>
+
+            <button onClick={handleRun} disabled={isProcessing}
+                 className="w-full bg-amber-500 hover:bg-amber-600 disabled:bg-slate-700 text-slate-900 font-bold py-4 rounded-xl transition-all flex items-center justify-center gap-3 shadow-lg shadow-amber-500/20 active:scale-[0.98]">
+                 {isProcessing ? <div className="animate-spin rounded-full h-5 w-5 border-3 border-slate-900 border-t-transparent"></div> : <Zap size={20} fill="currentColor" />}
+                 Otimizar Tudo (M+T)
             </button>
-            {activeShift.rawData.length > 0 && (
-                 <button onClick={handleRun} disabled={activeShift.status === 'geocoding' || activeShift.status === 'solving'}
-                 className="mt-4 w-full bg-amber-500 hover:bg-amber-600 disabled:bg-slate-700 text-slate-900 font-bold py-3 px-4 rounded-lg transition-all flex items-center justify-center gap-2 shadow-lg shadow-amber-500/20">
-                 {activeShift.status === 'geocoding' ? <div className="animate-spin rounded-full h-4 w-4 border-2 border-slate-900 border-t-transparent"></div> : <Zap size={18} fill="currentColor" />}
-                 Otimizar {state.currentShift === 'morning' ? 'Manhã' : 'Tarde'}
-               </button>
-            )}
-          </div>
 
-          <div className="flex-1 p-5 overflow-hidden flex flex-col">
-            <h2 className="text-[10px] uppercase tracking-widest text-slate-500 font-bold mb-2 flex items-center gap-2">
-                <Terminal size={14} /> Console de Operação
-            </h2>
-            <div className="flex-1 bg-black rounded-lg p-3 overflow-y-auto font-mono text-[10px] text-green-500 scrollbar-hide">
-                {state.logs.map((log, i) => <div key={i} className="mb-1 border-b border-slate-900 pb-1">{log}</div>)}
-                {state.logs.length === 0 && <span className="text-slate-800">Aguardando dados...</span>}
+            <div className="flex-1 min-h-[150px] bg-black/40 rounded-xl border border-slate-800 p-4 font-mono text-[9px] text-green-400 overflow-y-auto scrollbar-hide">
+                <div className="flex items-center gap-2 mb-2 text-slate-500 uppercase font-bold tracking-widest border-b border-slate-800 pb-2"><Terminal size={12}/> Console de Operações</div>
+                {state.logs.map((log, i) => <div key={i} className="mb-1 leading-relaxed"> {log}</div>)}
+                {state.logs.length === 0 && <span className="text-slate-700 italic">Aguardando importação ou otimização...</span>}
+            </div>
+
+            <div className="bg-slate-800/50 p-4 rounded-xl border border-slate-700">
+                <input type="file" ref={fileInputRef} className="hidden" accept=".xlsx, .xls" onChange={handleFileChange} />
+                <button onClick={() => fileInputRef.current?.click()} className="w-full flex items-center justify-center gap-2 text-amber-500 hover:text-amber-400 font-bold text-xs uppercase tracking-tight">
+                    <Table size={16} /> Carregar Nova Planilha
+                </button>
             </div>
           </div>
         </aside>
 
+        {/* Main Content */}
         <main className="flex-1 flex flex-col h-full overflow-hidden">
-            <div className="bg-white border-b border-slate-200 px-6 py-2 flex items-center gap-2">
-                <button onClick={() => setActiveTab('map')} className={`flex items-center gap-2 px-4 py-2 text-xs font-bold uppercase rounded-md transition-colors ${activeTab === 'map' ? 'bg-slate-100 text-amber-600' : 'text-slate-500 hover:bg-slate-50'}`}>
-                    <MapIcon size={14} /> Visualização Geográfica
+            <div className="bg-white border-b border-slate-200 px-8 py-3 flex items-center gap-4">
+                <button onClick={() => setActiveTab('data')} className={`flex items-center gap-2 px-5 py-2.5 text-xs font-bold uppercase rounded-lg transition-all ${activeTab === 'data' ? 'bg-amber-50 text-amber-600 border border-amber-100 shadow-sm' : 'text-slate-500 hover:bg-slate-100 border border-transparent'}`}>
+                    <Table size={14} /> Dashboard BI
                 </button>
-                <button onClick={() => setActiveTab('data')} className={`flex items-center gap-2 px-4 py-2 text-xs font-bold uppercase rounded-md transition-colors ${activeTab === 'data' ? 'bg-slate-100 text-amber-600' : 'text-slate-500 hover:bg-slate-50'}`}>
-                    <Table size={14} /> Cronograma Detalhado
+                <button onClick={() => setActiveTab('map')} className={`flex items-center gap-2 px-5 py-2.5 text-xs font-bold uppercase rounded-lg transition-all ${activeTab === 'map' ? 'bg-amber-50 text-amber-600 border border-amber-100 shadow-sm' : 'text-slate-500 hover:bg-slate-100 border border-transparent'}`}>
+                    <MapIcon size={14} /> Mapa de Rotas
                 </button>
             </div>
 
-            <div className="flex-1 p-6 overflow-y-auto">
+            <div className="flex-1 p-8 overflow-y-auto bg-slate-50/50">
                 {activeTab === 'map' ? (
                     <MapVisualizer routes={activeShift.routes} origin={state.originCoords} />
                 ) : (
