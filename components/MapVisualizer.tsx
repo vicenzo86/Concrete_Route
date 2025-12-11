@@ -12,28 +12,47 @@ const originIcon = L.divIcon({
 });
 
 // Function to create numbered truck icon
-const createTruckIcon = (number: number, color: string) => L.divIcon({
+const createTruckIcon = (number: number, color: string, count: number) => L.divIcon({
     html: `
-      <div style="
-        background-color: ${color}; 
-        width: 28px; 
-        height: 28px; 
-        border-radius: 50%; 
-        color: white; 
-        display: flex; 
-        align-items: center; 
-        justify-content: center; 
-        font-weight: bold; 
-        font-size: 14px; 
-        border: 2px solid white; 
-        box-shadow: 0 2px 4px rgba(0,0,0,0.3);
-      ">
-        ${number}
+      <div style="position: relative;">
+        <div style="
+          background-color: ${color}; 
+          width: 30px; 
+          height: 30px; 
+          border-radius: 50%; 
+          color: white; 
+          display: flex; 
+          align-items: center; 
+          justify-content: center; 
+          font-weight: bold; 
+          font-size: 14px; 
+          border: 2px solid white; 
+          box-shadow: 0 3px 6px rgba(0,0,0,0.4);
+        ">
+          ${number}
+        </div>
+        ${count > 1 ? `
+        <div style="
+          position: absolute;
+          top: -5px;
+          right: -5px;
+          background-color: #ef4444;
+          color: white;
+          width: 16px;
+          height: 16px;
+          border-radius: 50%;
+          font-size: 10px;
+          display: flex;
+          align-items: center;
+          justify-content: center;
+          border: 1px solid white;
+          font-weight: bold;
+        ">${count}</div>` : ''}
       </div>`,
     className: 'custom-truck-icon',
-    iconSize: [28, 28],
-    iconAnchor: [14, 14], // Center the icon
-    popupAnchor: [0, -14]
+    iconSize: [30, 30],
+    iconAnchor: [15, 15],
+    popupAnchor: [0, -15]
 });
 
 interface MapProps {
@@ -61,43 +80,59 @@ const BoundsController: React.FC<{ routes: Route[], origin: GeoCoord | null }> =
     return null;
 };
 
-// Logic to calculate offset coordinates so markers don't overlap exactly
+// Logic to calculate offset coordinates for POLYLINES only (to prevent overlap)
 const getOffsetCoords = (coord: GeoCoord, routeIndex: number): L.LatLngTuple => {
-    // Increased scale slightly to make sure icons don't touch if they are at same address
     const scale = 0.00015; 
     const shift = (routeIndex + 1) * scale;
-    // Shift both lat and lng to create a diagonal separation line for different trucks at same spot
     return [coord.lat + shift, coord.lng + shift];
 };
 
+interface GroupedLocation {
+    id: string; // lat,lng
+    coords: GeoCoord;
+    address: string;
+    totalVolume: number;
+    deliveries: Array<{
+        truckId: string;
+        truckNumber: number;
+        color: string;
+        volume: number;
+        stopIndex: number;
+    }>;
+}
+
 const MapVisualizer: React.FC<MapProps> = ({ routes, origin }) => {
   
-  // Flatten all stops into a single array of markers
-  // This ensures that if Truck 1 and Truck 2 go to the same address, 
-  // we render TWO separate markers.
-  const allMarkers = useMemo(() => {
-    const markers: any[] = [];
+  // Group stops by location (coordinate) to create a single marker per address
+  const groupedLocations = useMemo(() => {
+    const map = new Map<string, GroupedLocation>();
 
     routes.forEach((route, rIdx) => {
         route.stops.forEach((stop, sIdx) => {
-            // Apply offset based on truck index
-            // This physically separates markers at the same address based on who is delivering
-            const [lat, lng] = getOffsetCoords(stop.coords, rIdx);
+            const key = `${stop.coords.lat},${stop.coords.lng}`;
+            
+            if (!map.has(key)) {
+                map.set(key, {
+                    id: key,
+                    coords: stop.coords,
+                    address: stop.endereco,
+                    totalVolume: 0,
+                    deliveries: []
+                });
+            }
 
-            markers.push({
-                uniqueId: `${route.id}-${sIdx}`,
-                lat,
-                lng,
+            const loc = map.get(key)!;
+            loc.totalVolume += stop.volume;
+            loc.deliveries.push({
                 truckId: route.id,
-                truckNumber: rIdx + 1, // Assumes routes are ordered Truck 1, Truck 2...
+                truckNumber: rIdx + 1,
                 color: route.color,
-                stopIndex: sIdx + 1,
                 volume: stop.volume,
-                address: stop.endereco
+                stopIndex: sIdx + 1
             });
         });
     });
-    return markers;
+    return Array.from(map.values());
   }, [routes]);
 
   return (
@@ -122,9 +157,8 @@ const MapVisualizer: React.FC<MapProps> = ({ routes, origin }) => {
             </Marker>
         )}
 
-        {/* Routes Polylines */}
+        {/* Routes Polylines (Still separate to show paths) */}
         {routes.map((route, rIdx) => {
-            // Build polyline points including origin start/end
             const points: L.LatLngTuple[] = [];
             if (origin) points.push(getOffsetCoords(origin, rIdx));
             route.stops.forEach(s => points.push(getOffsetCoords(s.coords, rIdx)));
@@ -136,43 +170,61 @@ const MapVisualizer: React.FC<MapProps> = ({ routes, origin }) => {
                     positions={points} 
                     color={route.color}
                     weight={4}
-                    opacity={0.6} // Slightly lower opacity to let markers pop
+                    opacity={0.6}
                     dashArray="8, 6" 
                 />
             );
         })}
 
-        {/* Individual Stop Markers */}
-        {allMarkers.map((m) => (
-             <Marker 
-                key={m.uniqueId} 
-                position={[m.lat, m.lng]} 
-                icon={createTruckIcon(m.truckNumber, m.color)}
-             >
-                <Popup>
-                    <div className="min-w-[180px] font-sans">
-                        <h3 className="font-bold text-slate-900 border-b border-slate-200 pb-2 mb-2 text-sm leading-tight">
-                            {m.address}
-                        </h3>
-                        <div className="text-xs text-slate-700">
-                            <div className="grid grid-cols-[60px_1fr] gap-1">
-                                <span className="font-semibold text-slate-500">Route:</span>
-                                <span className="font-medium flex items-center gap-2">
-                                    <span className="w-2 h-2 rounded-full" style={{background: m.color}}></span>
-                                    {m.truckId}
-                                </span>
-                                
-                                <span className="font-semibold text-slate-500">Stop:</span>
-                                <span>{m.stopIndex}</span>
-                                
-                                <span className="font-semibold text-slate-500">Volume:</span>
-                                <span className="font-bold text-slate-900">{m.volume} m³</span>
+        {/* Grouped Location Markers */}
+        {groupedLocations.map((loc) => {
+             // Use the color of the first delivery for the pin
+             const firstDelivery = loc.deliveries[0];
+             
+             return (
+                 <Marker 
+                    key={loc.id} 
+                    position={[loc.coords.lat, loc.coords.lng]} 
+                    icon={createTruckIcon(firstDelivery.truckNumber, firstDelivery.color, loc.deliveries.length)}
+                 >
+                    <Popup maxWidth={300}>
+                        <div className="font-sans">
+                            {/* Header */}
+                            <div className="border-b border-slate-200 pb-2 mb-2">
+                                <h3 className="font-bold text-slate-900 text-sm leading-tight mb-1">
+                                    {loc.address}
+                                </h3>
+                                <div className="flex items-center justify-between">
+                                    <span className="text-xs text-slate-500 font-semibold uppercase">Total Volume</span>
+                                    <span className="text-base font-bold text-blue-700">{loc.totalVolume.toFixed(2)} m³</span>
+                                </div>
+                            </div>
+
+                            {/* Deliveries List */}
+                            <div className="space-y-2 max-h-[150px] overflow-y-auto">
+                                {loc.deliveries.map((d, i) => (
+                                    <div key={i} className="flex items-center justify-between text-xs bg-slate-50 p-2 rounded border border-slate-100">
+                                        <div className="flex items-center gap-2">
+                                            <span 
+                                                className="w-5 h-5 rounded-full text-white flex items-center justify-center font-bold text-[10px]"
+                                                style={{backgroundColor: d.color}}
+                                            >
+                                                {d.truckNumber}
+                                            </span>
+                                            <div className="flex flex-col">
+                                                <span className="font-medium text-slate-700">{d.truckId}</span>
+                                                <span className="text-[10px] text-slate-400">Stop #{d.stopIndex}</span>
+                                            </div>
+                                        </div>
+                                        <span className="font-bold text-slate-800">{d.volume} m³</span>
+                                    </div>
+                                ))}
                             </div>
                         </div>
-                    </div>
-                </Popup>
-             </Marker>
-        ))}
+                    </Popup>
+                 </Marker>
+             );
+        })}
 
       </MapContainer>
     </div>

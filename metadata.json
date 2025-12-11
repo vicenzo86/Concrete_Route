@@ -1,5 +1,5 @@
 {
-  "name": "RouteOptimizer Pro",
-  "description": "A logistics dashboard to optimize truck routes using Clarke & Wright algorithm with HERE Maps integration.",
+  "name": "Plaster Router",
+  "description": "Roteirizador para argamassa. A logistics dashboard to optimize truck routes using Clarke & Wright algorithm with HERE Maps integration.",
   "requestFramePermissions": []
 }

@@ -14,27 +14,48 @@ export interface DeliveryStop {
   volume: number;
   endereco: string;
   originalIndex: number;
+  arrivalTime?: string;
+  unloadingDurationMin?: number;
+  departureTime?: string;
 }
 
 export interface Route {
-  id: string; // usually truck id
+  id: string; 
   stops: DeliveryStop[];
   totalVolume: number;
   totalDistanceKm: number;
   color: string;
+  startTime?: string;
+  loadingTimeMin?: number;
+  returnToDepotTime?: string;
+  totalCycleTimeMin?: number;
 }
 
 export interface SolverConfig {
   apiKey: string;
   originAddress: string;
   truckCapacity: number;
+  startTime: string;        
+  loadingTimeMin: number;   
+  unloadingMinPerM3: number; 
+}
+
+export type Shift = 'morning' | 'afternoon';
+
+export interface ShiftState {
+  rawData: RawInputRow[];
+  routes: Route[];
+  status: 'idle' | 'parsing' | 'geocoding' | 'solving' | 'complete' | 'error';
+  unmappedAddresses: string[];
 }
 
 export interface AppState {
   config: SolverConfig;
-  status: 'idle' | 'parsing' | 'geocoding' | 'solving' | 'complete' | 'error';
+  currentShift: Shift;
+  shifts: {
+    morning: ShiftState;
+    afternoon: ShiftState;
+  };
   logs: string[];
-  routes: Route[];
-  unmappedAddresses: string[];
   originCoords: GeoCoord | null;
 }

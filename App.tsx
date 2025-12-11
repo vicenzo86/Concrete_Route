@@ -1,15 +1,21 @@
 import React, { useState, useRef } from 'react';
 import * as XLSX from 'xlsx';
-import { Truck, MapPin, Settings, Upload, Play, AlertCircle, Terminal, Map as MapIcon, Table, Download } from 'lucide-react';
+import { Truck, MapPin, Settings, Upload, Play, AlertCircle, Terminal, Map as MapIcon, Table, Download, Clock, Zap, Sun, Moon } from 'lucide-react';
 import MapVisualizer from './components/MapVisualizer';
 import ResultsTable from './components/ResultsTable';
-import { AppState, RawInputRow } from './types';
+import { AppState, RawInputRow, Shift, ShiftState } from './types';
 import { processOptimization } from './services/optimizer';
 
-// Default config values from the Python script
 const DEFAULT_API_KEY = "9bzBwwsjHfKmfIrrYpvtir7DbEjTUOj2vFWrAC72c4A";
 const DEFAULT_ORIGIN = "R. Geral Hugo de Almeida - Navegantes - SC, Brasil";
 const DEFAULT_CAPACITY = 9;
+
+const initialShiftState: ShiftState = {
+  rawData: [],
+  routes: [],
+  status: 'idle',
+  unmappedAddresses: [],
+};
 
 const App: React.FC = () => {
   const [state, setState] = useState<AppState>({
@@ -17,17 +23,23 @@ const App: React.FC = () => {
       apiKey: DEFAULT_API_KEY,
       originAddress: DEFAULT_ORIGIN,
       truckCapacity: DEFAULT_CAPACITY,
+      startTime: "07:00",
+      loadingTimeMin: 20,
+      unloadingMinPerM3: 10,
     },
-    status: 'idle',
+    currentShift: 'morning',
+    shifts: {
+      morning: { ...initialShiftState },
+      afternoon: { ...initialShiftState },
+    },
     logs: [],
-    routes: [],
-    unmappedAddresses: [],
     originCoords: null
   });
 
   const [activeTab, setActiveTab] = useState<'map' | 'data'>('map');
-  const [rawData, setRawData] = useState<RawInputRow[]>([]);
   const fileInputRef = useRef<HTMLInputElement>(null);
+
+  const activeShift = state.shifts[state.currentShift];
 
   const addLog = (msg: string) => {
     setState(prev => ({ ...prev, logs: [...prev.logs, msg] }));
@@ -37,326 +49,212 @@ const App: React.FC = () => {
     const file = e.target.files?.[0];
     if (!file) return;
 
-    // Reset previous data
-    setRawData([]);
-    setState(prev => ({ ...prev, logs: [`📂 Reading file: ${file.name}...`], status: 'idle' }));
+    addLog(`📂 Lendo arquivo: ${file.name}...`);
 
     const reader = new FileReader();
-    
     reader.onload = (evt) => {
       try {
         const data = evt.target?.result;
-        if (!data) throw new Error("File is empty");
-
+        if (!data) throw new Error("Arquivo vazio");
         const wb = XLSX.read(data, { type: 'array' });
-        const wsname = wb.SheetNames[0];
-        const ws = wb.Sheets[wsname];
         
-        // Get data as array of arrays
-        const jsonData = XLSX.utils.sheet_to_json(ws, { header: 1 });
-        
-        if (!jsonData || jsonData.length < 2) {
-            addLog("❌ Error: File appears to be empty or has no data rows.");
-            return;
-        }
+        const newShifts = {
+          morning: { ...initialShiftState },
+          afternoon: { ...initialShiftState },
+        };
 
-        // Robust header finding
-        const headers = (jsonData[0] as any[]).map(h => String(h || '').toLowerCase().trim());
-        addLog(`🔍 Found headers: [${headers.join(", ")}]`);
+        wb.SheetNames.forEach(sheetName => {
+          const ws = wb.Sheets[sheetName];
+          const jsonData = XLSX.utils.sheet_to_json(ws, { header: 1 });
+          if (!jsonData || jsonData.length < 2) return;
 
-        // Flexible matching for Volume
-        const volIdx = headers.findIndex(h => 
-            h.includes('volume') || 
-            h.includes('m³') || 
-            h.includes('m3') || 
-            h.includes('vol') ||
-            h.includes('cubagem') ||
-            h.includes('qtd') ||
-            h.includes('carga') // Added support for 'CARGAS'
-        );
+          const headers = (jsonData[0] as any[]).map(h => String(h || '').toLowerCase().trim());
+          const volIdx = headers.findIndex(h => h.includes('m³') || h.includes('volume') || h.includes('carga'));
+          const addrIdx = headers.findIndex(h => h.includes('endereco') || h.includes('endereço') || h.includes('local') || h.includes('obra'));
 
-        // Flexible matching for Address
-        const addrIdx = headers.findIndex(h => 
-            h.includes('endereco') || 
-            h.includes('endereço') || 
-            h.includes('address') || 
-            h.includes('local') || 
-            h.includes('rua') || 
-            h.includes('destino') ||
-            h.includes('dest') ||
-            h.includes('cliente') ||
-            h.includes('obra')
-        );
+          if (volIdx === -1 || addrIdx === -1) return;
 
-        if (volIdx === -1 || addrIdx === -1) {
-            const missing = [];
-            if (volIdx === -1) missing.push("Volume (e.g., 'Cargas', 'Volume', 'm³')");
-            if (addrIdx === -1) missing.push("Address (e.g., 'Endereço Obra', 'Rua')");
-            
-            const msg = `❌ Missing columns: ${missing.join(" and ")}.`;
-            addLog(msg);
-            alert(msg + "\nPlease check the System Logs for details.");
-            return;
-        }
+          const parsed: RawInputRow[] = jsonData.slice(1).map((row: any) => ({
+            volume: parseFloat(row[volIdx]),
+            endereco: String(row[addrIdx] || '').trim()
+          })).filter(r => !isNaN(r.volume) && r.endereco.length > 3);
 
-        const parsed: RawInputRow[] = [];
-        let skipped = 0;
+          const nameUpper = sheetName.toUpperCase();
+          if (nameUpper.includes("MANHÃ") || nameUpper.includes("MANHA")) {
+            newShifts.morning.rawData = parsed;
+            addLog(`✅ Turno MANHÃ: ${parsed.length} pedidos carregados.`);
+          } else if (nameUpper.includes("TARDE")) {
+            newShifts.afternoon.rawData = parsed;
+            addLog(`✅ Turno TARDE: ${parsed.length} pedidos carregados.`);
+          }
+        });
 
-        for (let i = 1; i < jsonData.length; i++) {
-            const row: any = jsonData[i];
-            // Ensure row has data at the expected indices
-            if (row[volIdx] !== undefined && row[addrIdx]) {
-                const vol = parseFloat(row[volIdx]);
-                const addr = String(row[addrIdx]).trim();
-
-                if (!isNaN(vol) && addr.length > 3) {
-                    parsed.push({
-                        volume: vol,
-                        endereco: addr
-                    });
-                } else {
-                    skipped++;
-                }
-            }
-        }
-        
-        if (parsed.length === 0) {
-            addLog("❌ No valid data rows found after parsing.");
-            return;
-        }
-
-        setRawData(parsed);
-        addLog(`✅ Successfully loaded ${parsed.length} rows (${skipped} empty/invalid skipped).`);
-        
-        // Auto-switch to Data tab to show loaded data
-        // setActiveTab('data'); 
-
-      } catch (err: any) {
-        console.error(err);
-        addLog(`❌ File parse error: ${err.message}`);
-        alert("Error parsing Excel file. See logs.");
+        setState(prev => ({ ...prev, shifts: newShifts }));
+      } catch (err: any) { 
+        addLog(`❌ Erro no arquivo: ${err.message}`); 
       }
     };
-
-    reader.onerror = () => {
-        addLog("❌ Failed to read file.");
-    };
-
     reader.readAsArrayBuffer(file);
   };
 
   const handleRun = async () => {
-    if (rawData.length === 0) {
-        alert("Please upload a spreadsheet first.");
-        return;
-    }
-    if (!state.config.apiKey) {
-        alert("Please enter a HERE API Key.");
-        return;
-    }
-
-    setState(prev => ({ ...prev, status: 'geocoding', logs: [], routes: [] }));
+    if (activeShift.rawData.length === 0) return alert("Não há dados para este turno.");
+    
+    // Set status for current shift
+    setState(prev => ({
+      ...prev,
+      shifts: {
+        ...prev.shifts,
+        [prev.currentShift]: { ...prev.shifts[prev.currentShift], status: 'geocoding' }
+      },
+      logs: []
+    }));
 
     try {
-        const result = await processOptimization(rawData, state.config, addLog);
+        const result = await processOptimization(activeShift.rawData, state.config, addLog);
         setState(prev => ({
             ...prev,
-            status: 'complete',
-            routes: result.routes,
-            unmappedAddresses: result.unmapped,
-            originCoords: result.originCoords
+            originCoords: result.originCoords,
+            shifts: {
+              ...prev.shifts,
+              [prev.currentShift]: {
+                ...prev.shifts[prev.currentShift],
+                status: 'complete',
+                routes: result.routes,
+                unmappedAddresses: result.unmapped
+              }
+            }
         }));
     } catch (err: any) {
-        addLog(`❌ Error: ${err.message}`);
-        setState(prev => ({ ...prev, status: 'error' }));
+        addLog(`❌ Erro: ${err.message}`);
+        setState(prev => ({
+          ...prev,
+          shifts: {
+            ...prev.shifts,
+            [prev.currentShift]: { ...prev.shifts[prev.currentShift], status: 'error' }
+          }
+        }));
     }
   };
 
   return (
-    <div className="flex flex-col h-screen bg-slate-50">
-      {/* Header */}
-      <header className="bg-white border-b border-slate-200 px-6 py-4 flex items-center justify-between shadow-sm z-10">
+    <div className="flex flex-col h-screen bg-slate-50 font-sans">
+      <header className="bg-slate-900 border-b border-slate-700 px-6 py-4 flex items-center justify-between shadow-lg z-10 text-white">
         <div className="flex items-center gap-3">
-          <div className="p-2 bg-blue-600 rounded-lg shadow-md">
-            <Truck className="text-white w-6 h-6" />
+          <div className="p-2 bg-amber-500 rounded-lg shadow-md">
+            <Truck className="text-slate-900 w-6 h-6" />
           </div>
           <div>
-            <h1 className="text-xl font-bold text-slate-800 tracking-tight">RouteOptimizer <span className="text-blue-600">Pro</span></h1>
-            <p className="text-xs text-slate-500 font-medium">VRP Solver powered by Clarke & Wright</p>
+            <h1 className="text-xl font-bold tracking-tight">Plaster Router</h1>
+            <p className="text-xs text-amber-500 font-medium uppercase tracking-widest">Controle de Turnos e Frota</p>
           </div>
         </div>
         
-        <div className="flex gap-3">
-            <a href="https://docs.google.com/spreadsheets/d/18tjFLyzDMzwS0r4jj9FXe5DzB00VqLWpd2bVgSpFtI0/export?format=xlsx&gid=617607591" 
-               className="text-xs text-blue-600 hover:underline flex items-center gap-1">
-               <Download size={12}/> Sample Sheet
-            </a>
+        <div className="flex bg-slate-800 rounded-lg p-1 border border-slate-700">
+            <button 
+                onClick={() => setState(p => ({...p, currentShift: 'morning'}))}
+                className={`flex items-center gap-2 px-4 py-1.5 rounded-md text-xs font-bold transition-all ${state.currentShift === 'morning' ? 'bg-amber-500 text-slate-900 shadow-sm' : 'text-slate-400 hover:text-white'}`}
+            >
+                <Sun size={14} /> MANHÃ
+            </button>
+            <button 
+                onClick={() => setState(p => ({...p, currentShift: 'afternoon'}))}
+                className={`flex items-center gap-2 px-4 py-1.5 rounded-md text-xs font-bold transition-all ${state.currentShift === 'afternoon' ? 'bg-amber-500 text-slate-900 shadow-sm' : 'text-slate-400 hover:text-white'}`}
+            >
+                <Moon size={14} /> TARDE
+            </button>
+        </div>
+
+        <div className="text-xs text-slate-400 flex items-center gap-4">
+            <div className="flex flex-col items-end">
+                <span>Pedidos Ativos</span>
+                <span className="text-white font-bold">{activeShift.rawData.length}</span>
+            </div>
+            <Download size={16} className="cursor-pointer hover:text-white" />
         </div>
       </header>
 
       <div className="flex flex-1 overflow-hidden">
-        {/* Sidebar Controls */}
-        <aside className="w-80 bg-white border-r border-slate-200 flex flex-col overflow-y-auto">
-          
-          <div className="p-6 border-b border-slate-100">
-            <h2 className="text-sm uppercase tracking-wider text-slate-400 font-bold mb-4 flex items-center gap-2">
-                <Settings size={14} /> Configuration
+        <aside className="w-80 bg-slate-800 border-r border-slate-700 flex flex-col overflow-y-auto text-slate-300">
+          <div className="p-5 border-b border-slate-700">
+            <h2 className="text-xs uppercase tracking-widest text-slate-500 font-bold mb-4 flex items-center gap-2">
+                <Settings size={14} /> Configuração Operacional
             </h2>
-            
             <div className="space-y-4">
               <div>
-                <label className="block text-xs font-semibold text-slate-700 mb-1">HERE Maps API Key</label>
-                <input 
-                  type="password" 
-                  value={state.config.apiKey}
-                  onChange={e => setState(p => ({...p, config: {...p.config, apiKey: e.target.value}}))}
-                  className="w-full px-3 py-2 border border-slate-300 rounded-md text-sm focus:ring-2 focus:ring-blue-500 focus:border-blue-500 outline-none transition-all"
-                />
-              </div>
-
-              <div>
-                <label className="block text-xs font-semibold text-slate-700 mb-1">Origin Address</label>
+                <label className="block text-[10px] font-bold text-slate-500 uppercase mb-1">Início do Turno</label>
                 <div className="relative">
-                    <MapPin className="absolute left-2.5 top-2.5 text-slate-400 w-4 h-4" />
-                    <input 
-                    type="text" 
-                    value={state.config.originAddress}
-                    onChange={e => setState(p => ({...p, config: {...p.config, originAddress: e.target.value}}))}
-                    className="w-full pl-9 pr-3 py-2 border border-slate-300 rounded-md text-sm focus:ring-2 focus:ring-blue-500 outline-none"
-                    />
+                    <Clock className="absolute left-2.5 top-2.5 text-slate-500 w-4 h-4" />
+                    <input type="time" value={state.config.startTime}
+                      onChange={e => setState(p => ({...p, config: {...p.config, startTime: e.target.value}}))}
+                      className="w-full pl-9 pr-3 py-2 bg-slate-900 border border-slate-700 rounded-md text-sm focus:ring-1 focus:ring-amber-500 outline-none"/>
                 </div>
               </div>
-
+              <div className="grid grid-cols-2 gap-2">
+                  <div>
+                    <label className="block text-[10px] font-bold text-slate-500 uppercase mb-1">Carga (min)</label>
+                    <input type="number" value={state.config.loadingTimeMin}
+                      onChange={e => setState(p => ({...p, config: {...p.config, loadingTimeMin: parseInt(e.target.value)}}))}
+                      className="w-full px-3 py-2 bg-slate-900 border border-slate-700 rounded-md text-sm focus:ring-1 focus:ring-amber-500 outline-none"/>
+                  </div>
+                  <div>
+                    <label className="block text-[10px] font-bold text-slate-500 uppercase mb-1">Descarga (min/m³)</label>
+                    <input type="number" value={state.config.unloadingMinPerM3}
+                      onChange={e => setState(p => ({...p, config: {...p.config, unloadingMinPerM3: parseInt(e.target.value)}}))}
+                      className="w-full px-3 py-2 bg-slate-900 border border-slate-700 rounded-md text-sm focus:ring-1 focus:ring-amber-500 outline-none"/>
+                  </div>
+              </div>
               <div>
-                <label className="block text-xs font-semibold text-slate-700 mb-1">Truck Capacity (m³)</label>
-                <input 
-                  type="number" 
-                  value={state.config.truckCapacity}
+                <label className="block text-[10px] font-bold text-slate-500 uppercase mb-1">Capacidade Caminhão (m³)</label>
+                <input type="number" value={state.config.truckCapacity}
                   onChange={e => setState(p => ({...p, config: {...p.config, truckCapacity: parseFloat(e.target.value)}}))}
-                  className="w-full px-3 py-2 border border-slate-300 rounded-md text-sm focus:ring-2 focus:ring-blue-500 outline-none"
-                />
+                  className="w-full px-3 py-2 bg-slate-900 border border-slate-700 rounded-md text-sm focus:ring-1 focus:ring-amber-500 outline-none"/>
               </div>
             </div>
           </div>
 
-          <div className="p-6 border-b border-slate-100 bg-slate-50/50">
-             <h2 className="text-sm uppercase tracking-wider text-slate-400 font-bold mb-4 flex items-center gap-2">
-                <Upload size={14} /> Data Input
-            </h2>
-            
-            <input 
-                type="file" 
-                ref={fileInputRef}
-                className="hidden" 
-                accept=".xlsx, .xls"
-                onChange={handleFileChange} 
-            />
-            
-            <button 
-                onClick={() => fileInputRef.current?.click()}
-                className="w-full border-2 border-dashed border-slate-300 rounded-lg p-6 flex flex-col items-center justify-center text-slate-500 hover:border-blue-500 hover:text-blue-600 hover:bg-blue-50 transition-all group cursor-pointer"
-            >
-                <Table className="w-8 h-8 mb-2 group-hover:scale-110 transition-transform" />
-                <span className="text-xs font-semibold">{rawData.length ? `${rawData.length} Rows Loaded` : "Upload Excel File"}</span>
+          <div className="p-5 border-b border-slate-700 bg-slate-900/20">
+            <input type="file" ref={fileInputRef} className="hidden" accept=".xlsx, .xls" onChange={handleFileChange} />
+            <button onClick={() => fileInputRef.current?.click()} className="w-full border-2 border-dashed border-slate-700 rounded-lg p-5 flex flex-col items-center justify-center text-slate-500 hover:border-amber-500 hover:text-amber-500 transition-all cursor-pointer">
+                <Table className="w-6 h-6 mb-2" />
+                <span className="text-[10px] font-bold uppercase tracking-tighter">Carregar Planilha Bi-Turno</span>
+                <span className="text-[9px] text-slate-600 mt-1">Abas: MANHÃ / TARDE</span>
             </button>
-            
-            {rawData.length > 0 && (
-                 <button 
-                 onClick={handleRun}
-                 disabled={state.status === 'geocoding' || state.status === 'solving'}
-                 className="mt-4 w-full bg-blue-600 hover:bg-blue-700 disabled:bg-slate-300 text-white font-semibold py-3 px-4 rounded-lg shadow-lg shadow-blue-200 transition-all flex items-center justify-center gap-2"
-               >
-                 {state.status === 'geocoding' || state.status === 'solving' ? (
-                    <div className="animate-spin rounded-full h-4 w-4 border-2 border-white border-t-transparent"></div>
-                 ) : (
-                    <Play size={18} fill="currentColor" />
-                 )}
-                 Generate Routes
+            {activeShift.rawData.length > 0 && (
+                 <button onClick={handleRun} disabled={activeShift.status === 'geocoding' || activeShift.status === 'solving'}
+                 className="mt-4 w-full bg-amber-500 hover:bg-amber-600 disabled:bg-slate-700 text-slate-900 font-bold py-3 px-4 rounded-lg transition-all flex items-center justify-center gap-2 shadow-lg shadow-amber-500/20">
+                 {activeShift.status === 'geocoding' ? <div className="animate-spin rounded-full h-4 w-4 border-2 border-slate-900 border-t-transparent"></div> : <Zap size={18} fill="currentColor" />}
+                 Otimizar {state.currentShift === 'morning' ? 'Manhã' : 'Tarde'}
                </button>
             )}
           </div>
 
-          <div className="flex-1 p-6 overflow-hidden flex flex-col">
-            <h2 className="text-sm uppercase tracking-wider text-slate-400 font-bold mb-2 flex items-center gap-2">
-                <Terminal size={14} /> System Logs
+          <div className="flex-1 p-5 overflow-hidden flex flex-col">
+            <h2 className="text-[10px] uppercase tracking-widest text-slate-500 font-bold mb-2 flex items-center gap-2">
+                <Terminal size={14} /> Console de Operação
             </h2>
-            <div className="flex-1 bg-slate-900 rounded-lg p-3 overflow-y-auto font-mono text-xs text-green-400">
-                {state.logs.length === 0 ? (
-                    <span className="text-slate-600">Waiting for input...</span>
-                ) : (
-                    state.logs.map((log, i) => (
-                        <div key={i} className="mb-1 border-b border-slate-800 pb-1 last:border-0">
-                            <span className="text-slate-500 mr-2">[{i+1}]</span>
-                            {log}
-                        </div>
-                    ))
-                )}
+            <div className="flex-1 bg-black rounded-lg p-3 overflow-y-auto font-mono text-[10px] text-green-500 scrollbar-hide">
+                {state.logs.map((log, i) => <div key={i} className="mb-1 border-b border-slate-900 pb-1">{log}</div>)}
+                {state.logs.length === 0 && <span className="text-slate-800">Aguardando dados...</span>}
             </div>
           </div>
-
         </aside>
 
-        {/* Main Content */}
-        <main className="flex-1 flex flex-col h-full overflow-hidden relative">
-            {/* Toolbar */}
-            <div className="bg-white border-b border-slate-200 px-6 py-2 flex items-center gap-4">
-                <button 
-                    onClick={() => setActiveTab('map')}
-                    className={`flex items-center gap-2 px-3 py-2 text-sm font-medium rounded-md transition-colors ${activeTab === 'map' ? 'bg-slate-100 text-blue-700' : 'text-slate-600 hover:bg-slate-50'}`}
-                >
-                    <MapIcon size={16} /> Map View
+        <main className="flex-1 flex flex-col h-full overflow-hidden">
+            <div className="bg-white border-b border-slate-200 px-6 py-2 flex items-center gap-2">
+                <button onClick={() => setActiveTab('map')} className={`flex items-center gap-2 px-4 py-2 text-xs font-bold uppercase rounded-md transition-colors ${activeTab === 'map' ? 'bg-slate-100 text-amber-600' : 'text-slate-500 hover:bg-slate-50'}`}>
+                    <MapIcon size={14} /> Visualização Geográfica
                 </button>
-                <button 
-                    onClick={() => setActiveTab('data')}
-                    className={`flex items-center gap-2 px-3 py-2 text-sm font-medium rounded-md transition-colors ${activeTab === 'data' ? 'bg-slate-100 text-blue-700' : 'text-slate-600 hover:bg-slate-50'}`}
-                >
-                    <Table size={16} /> Data & Export
+                <button onClick={() => setActiveTab('data')} className={`flex items-center gap-2 px-4 py-2 text-xs font-bold uppercase rounded-md transition-colors ${activeTab === 'data' ? 'bg-slate-100 text-amber-600' : 'text-slate-500 hover:bg-slate-50'}`}>
+                    <Table size={14} /> Cronograma Detalhado
                 </button>
-
-                <div className="ml-auto flex items-center gap-4">
-                    {state.status === 'complete' && (
-                        <div className="flex gap-4 text-sm font-medium">
-                            <div className="flex flex-col items-end leading-none">
-                                <span className="text-xs text-slate-400">Routes</span>
-                                <span className="text-slate-800">{state.routes.length}</span>
-                            </div>
-                            <div className="flex flex-col items-end leading-none">
-                                <span className="text-xs text-slate-400">Total Dist</span>
-                                <span className="text-slate-800">{state.routes.reduce((acc, r) => acc + r.totalDistanceKm, 0).toFixed(1)} km</span>
-                            </div>
-                        </div>
-                    )}
-                </div>
             </div>
 
-            <div className="flex-1 bg-slate-100 p-6 overflow-y-auto relative">
-                {state.status === 'error' && (
-                    <div className="absolute top-6 left-6 right-6 z-50 bg-red-50 border border-red-200 text-red-700 px-4 py-3 rounded-lg flex items-center gap-3 shadow-sm">
-                        <AlertCircle size={20} />
-                        <span className="font-medium">An error occurred. Check the logs sidebar for details.</span>
-                    </div>
-                )}
-
-                {activeTab === 'map' && (
-                    <MapVisualizer routes={state.routes} origin={state.originCoords} />
-                )}
-
-                {activeTab === 'data' && (
-                    <div className="max-w-5xl mx-auto">
-                        {state.unmappedAddresses.length > 0 && (
-                            <div className="mb-6 bg-amber-50 border border-amber-200 rounded-lg p-4">
-                                <h4 className="text-amber-800 font-bold text-sm flex items-center gap-2 mb-2">
-                                    <AlertCircle size={16}/> {state.unmappedAddresses.length} Addresses Could Not Be Mapped
-                                </h4>
-                                <ul className="list-disc list-inside text-xs text-amber-700 max-h-32 overflow-y-auto">
-                                    {state.unmappedAddresses.map((addr, i) => (
-                                        <li key={i}>{addr}</li>
-                                    ))}
-                                </ul>
-                            </div>
-                        )}
-                        <ResultsTable routes={state.routes} originAddress={state.config.originAddress} />
-                    </div>
+            <div className="flex-1 p-6 overflow-y-auto">
+                {activeTab === 'map' ? (
+                    <MapVisualizer routes={activeShift.routes} origin={state.originCoords} />
+                ) : (
+                    <ResultsTable routes={activeShift.routes} originAddress={state.config.originAddress} />
                 )}
             </div>
         </main>
