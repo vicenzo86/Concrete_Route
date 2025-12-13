@@ -1,10 +1,13 @@
-import React, { useState, useRef } from 'react';
+
+import React, { useState, useRef, useEffect } from 'react';
 import * as XLSX from 'xlsx';
-import { Truck, MapPin, Settings, Terminal, Map as MapIcon, Table, Download, Clock, Zap, Sun, Moon, Calendar, Key } from 'lucide-react';
+import { Truck, MapPin, Settings, Terminal, Map as MapIcon, Table, Download, Clock, Zap, Sun, Moon, Calendar, Key, LogOut, User } from 'lucide-react';
 import MapVisualizer from './components/MapVisualizer';
 import ResultsTable from './components/ResultsTable';
+import Auth from './components/Auth';
 import { AppState, RawInputRow, Shift, ShiftState } from './types';
 import { processOptimization } from './services/optimizer';
+import { supabase } from './lib/supabase';
 
 const DEFAULT_API_KEY = "9bzBwwsjHfKmfIrrYpvtir7DbEjTUOj2vFWrAC72c4A";
 const DEFAULT_ORIGIN = "R. Geral Hugo de Almeida - Navegantes - SC, Brasil";
@@ -17,6 +20,8 @@ const initialShiftState: ShiftState = {
 };
 
 const App: React.FC = () => {
+  const [session, setSession] = useState<any>(null);
+  const [isAuthLoading, setIsAuthLoading] = useState(true);
   const [state, setState] = useState<AppState>({
     config: {
       apiKey: DEFAULT_API_KEY,
@@ -37,11 +42,37 @@ const App: React.FC = () => {
 
   const [activeTab, setActiveTab] = useState<'map' | 'data'>('map');
   const fileInputRef = useRef<HTMLInputElement>(null);
+
+  useEffect(() => {
+    supabase.auth.getSession().then(({ data: { session } }) => {
+      setSession(session);
+      setIsAuthLoading(false);
+    });
+
+    const { data: { subscription } } = supabase.auth.onAuthStateChange((_event, session) => {
+      setSession(session);
+    });
+
+    return () => subscription.unsubscribe();
+  }, []);
+
+  if (isAuthLoading) return (
+    <div className="h-screen w-screen bg-slate-950 flex items-center justify-center">
+        <div className="animate-spin rounded-full h-12 w-12 border-4 border-amber-500 border-t-transparent"></div>
+    </div>
+  );
+
+  if (!session) return <Auth onSession={setSession} />;
+
   const activeShift = state.shifts[state.currentShift];
   const isProcessing = state.shifts.morning.status === 'geocoding' || state.shifts.afternoon.status === 'geocoding';
 
   const addLog = (msg: string) => {
     setState(prev => ({ ...prev, logs: [...prev.logs, msg] }));
+  };
+
+  const handleLogout = async () => {
+      await supabase.auth.signOut();
   };
 
   const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -167,10 +198,12 @@ const App: React.FC = () => {
                     <Moon size={14} /> TARDE {state.shifts.afternoon.rawData.length > 0 && `(${state.shifts.afternoon.rawData.length})`}
                 </button>
             </div>
-            <div className="text-xs text-slate-400 flex items-center gap-4 border-l border-slate-700 pl-6">
+            <div className="flex items-center gap-4 border-l border-slate-700 pl-6">
                 <div className="flex flex-col items-end">
-                    <span className="text-[9px] uppercase font-bold text-slate-500">Viagens Atuais</span>
-                    <span className="text-white font-bold text-sm">{activeShift.routes.length}</span>
+                    <span className="text-[10px] uppercase font-bold text-slate-500 flex items-center gap-1"><User size={10}/> {session.user.email.split('@')[0]}</span>
+                    <button onClick={handleLogout} className="text-[9px] text-amber-500 hover:text-amber-400 font-bold flex items-center gap-1 uppercase tracking-tighter">
+                        Sair <LogOut size={10} />
+                    </button>
                 </div>
             </div>
         </div>
