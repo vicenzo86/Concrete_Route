@@ -1,10 +1,12 @@
+
 import React from 'react';
 import { createRoot } from 'react-dom/client';
 import App from './App';
 
+console.log("🚀 Arga Router: Inicializando aplicação...");
+
 const container = document.getElementById('root');
 
-// Ensure root exists before rendering
 if (container) {
   const root = createRoot(container);
   root.render(
@@ -12,4 +14,6 @@ if (container) {
       <App />
     </React.StrictMode>
   );
+} else {
+  console.error("❌ Erro: Elemento #root não encontrado no DOM.");
 }

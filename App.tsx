@@ -44,12 +44,22 @@ const App: React.FC = () => {
   const fileInputRef = useRef<HTMLInputElement>(null);
 
   useEffect(() => {
-    supabase.auth.getSession().then(({ data: { session } }) => {
-      setSession(session);
-      setIsAuthLoading(false);
-    });
+    const checkSession = async () => {
+        try {
+            console.log("🔍 Verificando sessão no Supabase...");
+            const { data: { session } } = await supabase.auth.getSession();
+            setSession(session);
+        } catch (err) {
+            console.error("❌ Erro ao verificar sessão:", err);
+        } finally {
+            setIsAuthLoading(false);
+        }
+    };
+
+    checkSession();
 
     const { data: { subscription } } = supabase.auth.onAuthStateChange((_event, session) => {
+      console.log("🔄 Estado de autenticação alterado:", _event);
       setSession(session);
     });
 
@@ -57,8 +67,9 @@ const App: React.FC = () => {
   }, []);
 
   if (isAuthLoading) return (
-    <div className="h-screen w-screen bg-slate-950 flex items-center justify-center">
+    <div className="h-screen w-screen bg-slate-950 flex items-center justify-center flex-col gap-4">
         <div className="animate-spin rounded-full h-12 w-12 border-4 border-amber-500 border-t-transparent"></div>
+        <p className="text-amber-500 font-bold text-xs animate-pulse">CARREGANDO ARGA ROUTER...</p>
     </div>
   );
 
@@ -175,6 +186,9 @@ const App: React.FC = () => {
     }
   };
 
+  // Safe user display
+  const userDisplayName = session?.user?.email ? session.user.email.split('@')[0] : 'Operador';
+
   return (
     <div className="flex flex-col h-screen bg-slate-50 font-sans">
       {/* Header */}
@@ -200,7 +214,7 @@ const App: React.FC = () => {
             </div>
             <div className="flex items-center gap-4 border-l border-slate-700 pl-6">
                 <div className="flex flex-col items-end">
-                    <span className="text-[10px] uppercase font-bold text-slate-500 flex items-center gap-1"><User size={10}/> {session.user.email.split('@')[0]}</span>
+                    <span className="text-[10px] uppercase font-bold text-slate-500 flex items-center gap-1"><User size={10}/> {userDisplayName}</span>
                     <button onClick={handleLogout} className="text-[9px] text-amber-500 hover:text-amber-400 font-bold flex items-center gap-1 uppercase tracking-tighter">
                         Sair <LogOut size={10} />
                     </button>
